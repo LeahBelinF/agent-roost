@@ -16,7 +16,7 @@ except ImportError:  # the CLI commands need none of it
 
 # The look, after the Textual prototype: a dark slate frame, a near-black card, soft green for "you are
 # here", and greys for everything secondary.
-BG, CARD, RAISED, LINE = "#1b1e24", "#191c22", "#22262d", "#2d323a"
+BG, CARD, RAISED, LINE = "#1b1e24", "#191c22", "#22262d", "#3a4049"
 TEXT, MUTED, FAINT = "#d6dae0", "#8b929c", "#5c636d"
 GREEN, GREEN_BG, YELLOW, RED, BLUE = "#6bd968", "#1d2b20", "#e3b341", "#f0776c", "#79b8ff"
 # The colors the screens ask for by pair number: the five basic ones, soft grey for secondary text, a
@@ -49,6 +49,12 @@ class Line:
             x += n
         return x
 
+    def edge(self, x, text, attr):
+        """An outline's characters, in the faint line color when attr is the dim one (as rule draws)."""
+        for i, ch in enumerate(text):
+            if 0 <= x + i < self.width:
+                self.cells[x + i] = (ch, ("rule", attr))
+
     def rule(self, x, n, attr):
         """A line across n columns, in the faint line color when attr is the dim one."""
         for i in range(x, min(x + max(n, 0), self.width)):
@@ -79,11 +85,12 @@ class Line:
         return self.ui.style(attr or 0, self.card)
 
 
-def wren_below(region, out):
+def wren_below(region, out, reserve=0):
     """The wren, centred under a list with nothing to show, when the whole bird fits below what's drawn
-    (out, the region's lines so far): never a clipped one. Adds its lines to out."""
+    (out, the region's lines so far) and above the reserve lines kept at the bottom: never a clipped
+    one. Adds its lines to out."""
     art = wren.wren_rows()
-    if not art or len(out) + 1 + len(art) > region.size.height:
+    if not art or len(out) + 1 + len(art) + reserve > region.size.height:
         return
     x = max((region.size.width - len(art[0])) // 2, 0)
     out.append(region.line())
@@ -133,6 +140,23 @@ if Widget:
         def line(self, fill=None):
             return Line(self.ui, self.size.width, fill, card=getattr(self, "CARD", False))
 
+        def outline(self, rows, x, w, head, count, edge, title=curses.A_BOLD):
+            """Draw a rounded outline on rows, from column x, w wide: the title (and its count, dim) set
+            into the top edge. edge is the outline's look: the dim one draws it in the faint line color."""
+            top, bottom = rows[0], rows[-1]
+            top.edge(x, "╭─ ", edge)
+            end = top.put(x + 3, head, title)
+            if count:
+                end = top.put(end + 1, str(count), self.ui.DIM)
+            top.edge(end + 1, "─" * max(x + w - 2 - end, 0), edge)
+            top.edge(end, " ", edge)
+            top.edge(x + w - 1, "╮", edge)
+            for row in rows[1:-1]:
+                row.edge(x, "│", edge)
+                row.edge(x + w - 1, "│", edge)
+            bottom.edge(x, "╰" + "─" * (w - 2) + "╯", edge)
+            return rows
+
         def on_click(self, event):
             event.stop()
             if event.button == 1 and event.chain <= 2:  # a third click in a row would act a second time
@@ -173,7 +197,8 @@ if Widget:
             return [row]
 
     class TopBar(Region):
-        """The top row: Agent Roost, the tabs (the current one in green), and the tab's own note at the right."""
+        """The top row: Agent Roost, the tabs (the current one in green), and the tab's own note at the right;
+        a rule under it, and on a tab with a summary strip, the strip under that."""
         NAME = "Agent Roost"
 
         def lines(self):
@@ -191,7 +216,23 @@ if Widget:
                 row.put(w - len(text) - 2, text, attr)
             rule = self.line()
             rule.rule(0, w, ui.DIM)
-            return [row, self.line(), rule]
+            out = [row, self.line(), rule]
+            parts = ui.strip()
+            if parts:
+                out += [self.line(), self.strip(parts)]
+            return out
+
+        def strip(self, parts):
+            """The summary strip, centered: for each part, its mark in its colour, its number bold, and its word dim."""
+            width = sum(len(f"{mark} " if mark else "") + len(number) + 1 + len(word) for mark, _, number, word in parts)
+            width += 5 * (len(parts) - 1)
+            ui, row, x = self.ui, self.line(), max(2, (self.size.width - width) // 2)
+            for mark, attr, number, word in parts:
+                if mark:
+                    x = row.put(x, mark, attr) + 1
+                x = row.put(x, number, curses.A_BOLD) + 1
+                x = row.put(x, word, ui.DIM) + 5
+            return row
 
     class StatusBar(Region):
         """The row above the key bar, on every tab: Sessions waiting on you at the left, how many run at the right."""

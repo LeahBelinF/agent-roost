@@ -670,8 +670,9 @@ class TwoPanes(unittest.TestCase):
 
     @staticmethod
     def detail_name(bold):
-        """The bold text the detail pane draws (right of the sidebar): the selected row's name first."""
-        return [t for y, x, t in sorted(bold) if x >= roost.SIDEBAR_W]
+        """The bold text the detail pane draws (right of the sidebar): the selected row's name first. The summary
+        strip's numbers and amounts, bold too, are left out."""
+        return [t for y, x, t in sorted(bold) if x >= roost.SIDEBAR_W and not re.fullmatch(r"\$?[\d.,]+", t)]
 
     @staticmethod
     def row_name(r):
@@ -715,12 +716,19 @@ class TwoPanes(unittest.TestCase):
         side = self.sidebar(lines)
         for title in ("NAME", "STATUS", "SESSIONS", "CATEGORY", "TAGS", "LAST WORKED"):
             self.assertFalse([l for l in lines if re.search(rf"\b{title}\b", l)], title)
-        for cell in ("awaiting-vendor", "procurement", "zq-tag"):  # Printer fleet's status, category, and tag
+        for cell in ("procurement", "zq-tag"):  # Printer fleet's category and tag
             self.assertFalse([l for l in lines if cell in l], cell)
-        for l in side:
+        names = {i for i, l in enumerate(side) for label in ("Printer fleet", "Restore drill", "Quiet one", "Badge rollout")
+                 if label in l}
+        seconds = {i + 1 for i in names}  # each project's second line: its status, running count, and when
+        fleet = next(i for i in names if "Printer fleet" in side[i])
+        self.assertEqual([i for i, l in enumerate(side) if "awaiting-vendor" in l], [fleet + 1],
+                         "Printer fleet's status only on its own second line")
+        for i, l in enumerate(side):
             self.assertNotRegex(l, r"[○◆●]\d", "no running counts in the sidebar")
-            self.assertNotRegex(l, SHORT_DATE)
-            self.assertNotRegex(l, r"\d:\d\d (AM|PM)")
+            if i not in seconds:
+                self.assertNotRegex(l, SHORT_DATE)
+                self.assertNotRegex(l, r"\d:\d\d (AM|PM)")
         ui, last = app.ui, -1
         rows = ui.project_rows()
         self.assertEqual([r.kind for r in rows if r.kind in ("head", "all", "sub")], [], "no headers, sub-project rows, or All projects")
@@ -2163,6 +2171,67 @@ class DetailSections(unittest.TestCase):
         self.assertEqual(self.section(ui, "project", "b", "Sessions"), ["none in the last 7 days"])
         self.assertEqual(self.section(ui, "project", "c", "Sessions"), ["none in the last 7 days"])
 
+    @staticmethod
+    def covering(s):
+        """A Handoff's frontmatter that covers Session s to its last message."""
+        to = datetime.fromtimestamp(s.get("active") or s["last"], timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        return f"session: {s['id']}\nname: Covered\nto: {to}\n"
+
+    def test_a_closed_session_a_handoff_covers_never_shows_however_recent(self):
+        ids = ["aa000000-0000", "bb000000-0000", "cc000000-0000"]
+        folder = self.project("b", self.readme(ids))
+        closed = lambda name, mins, sid: dict(session(name, state="closed", kind=None, mins=mins), id=sid, attach=None)
+        wrapped, bare = closed("Wrapped just now", 1, ids[0]), closed("Not handed off", 120, ids[1])
+        self.handoffs(folder, [(time.time() - 30, self.covering(wrapped))])
+        ui = self.ui([wrapped, bare, dict(session("Still going", mins=5), id=ids[2])])
+        p = self.row(ui, "project", "b").item
+        self.assertEqual([ui.wrapped_up(p, s) for s in (wrapped, bare)], [True, False])  # the fixture
+        lines = self.section(ui, "project", "b", "Sessions")
+        self.assertFalse([l for l in lines if "Wrapped just now" in l], lines)
+        self.assertEqual(len(lines), 2, lines)
+        self.assertIn("Still going", lines[0])
+        self.assertIn("Not handed off", lines[1])
+
+    def test_wrapped_closed_sessions_take_none_of_the_5_rows(self):
+        """Five newer wrapped-up Sessions leave room for an older closed one no Handoff covers."""
+        ids = [f"{i:02d}000000-0000" for i in range(6)]
+        folder = self.project("b", self.readme(ids))
+        closed = lambda name, mins, sid: dict(session(name, state="closed", kind=None, mins=mins), id=sid, attach=None)
+        wrapped = [closed(f"Wrapped {i}", 10 + i, ids[i]) for i in range(5)]
+        bare = closed("Not handed off", 3 * 1440, ids[5])
+        self.handoffs(folder, [(time.time() - 60, self.covering(s)) for s in wrapped])
+        ui = self.ui(wrapped + [bare])
+        lines = self.section(ui, "project", "b", "Sessions")
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("Not handed off", lines[0])
+
+    def test_a_project_with_only_wrapped_closed_sessions_shows_the_empty_state(self):
+        ids = ["aa000000-0000", "bb000000-0000"]
+        folder = self.project("b", self.readme(ids))
+        self.project("c", self.readme(), handoffs=[TODAY()])  # no Sessions at all
+        closed = lambda name, mins, sid: dict(session(name, state="closed", kind=None, mins=mins), id=sid, attach=None)
+        listed = [closed("Wrapped one", 5, ids[0]), closed("Wrapped two", 90, ids[1])]
+        self.handoffs(folder, [(time.time() - 60, self.covering(s)) for s in listed])
+        ui = self.ui(listed)
+        self.assertEqual(self.section(ui, "project", "b", "Sessions"), self.section(ui, "project", "c", "Sessions"))
+        self.assertEqual(self.section(ui, "project", "b", "Sessions"), ["none in the last 7 days"])
+        self.assertFalse([k for k, _ in ui.detail_items(self.row(ui, "project", "b")) if k == "session"])
+
+    def test_a_sub_projects_wrapped_closed_session_never_shows(self):
+        self.project("rollout", self.readme(), handoffs=[TODAY()])
+        closed = lambda name, mins, sid: dict(session(name, state="closed", kind=None, mins=mins), id=sid, attach=None)
+        wrapped, bare = closed("Wrapped sub one", 5, "aa000000-0000"), closed("Bare sub one", 60, "bb000000-0000")
+        self.sub("rollout", "alpha", sessions=[("x", wrapped["id"]), ("y", bare["id"])],
+                 handoffs=[(handoff_name(time.time() - 30), f"---\n{self.covering(wrapped)}---\n\nDone.\n")])
+        ui = self.ui([wrapped, bare])
+        alpha = next(s for s in self.row(ui, "project", "rollout").item["subs"] if s["slug"] == "alpha")
+        sub = roost.Row("Recent", "sub", alpha, 0)  # its details, as the sub-project's own row shows them
+        self.assertTrue(ui.wrapped_up(sub.item, wrapped))  # the fixture
+        lines = [list(l) for h, l in ui.detail_sections(sub) if h == "Sessions"][0]
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("Bare sub one", lines[0])
+        self.assertEqual([x["name"] for k, x in ui.detail_items(sub) if k == "session"], ["Bare sub one"])
+
     # 3. Handoffs
 
     def test_handoffs_lists_the_newest_5_each_its_time_then_its_title(self):
@@ -2315,12 +2384,13 @@ class SectionsOnScreen(unittest.TestCase):
         return got[0]
 
     def assert_under(self, lines, bold, heading, text, before=None):
-        """text is on a line under heading (and above the next heading, before), indented past it."""
+        """text is on a line under heading (and above the next heading, before), inside its outline: two columns in
+        from the outline's left edge, which is one column left of the title (╭─ Title)."""
         y, x = self.heading_at(bold, heading)
         stop = before or len(lines)
         i = next((i for i in range(y + 1, stop) if text in lines[i][roost.SIDEBAR_W:]), None)
         self.assertIsNotNone(i, (heading, text, lines[y:stop]))
-        self.assertGreater(lines[i].index(text, roost.SIDEBAR_W), x, (heading, lines[i]))
+        self.assertGreaterEqual(lines[i].index(text, roost.SIDEBAR_W), x - 1, (heading, lines[i]))
         self.assertEqual(lines[y - 1][roost.SIDEBAR_W:].strip(), "", f"no blank line above {heading}")
 
     def test_the_details_draw_each_section_with_the_fields_under_details(self):
@@ -2332,7 +2402,7 @@ class SectionsOnScreen(unittest.TestCase):
         self.assertIsNotNone(described, lines)
         repo = next((l for l in lines if "~/code/fleet-tools" in l[W:]), "")
         self.assertIn("Repo", repo[W:], lines)
-        heads = ["Sessions", "Handoffs", "Notes", "Details", "Stats"]
+        heads = ["Sessions", "Handoffs", "Notes", "Details", "This month"]
         ys = [self.heading_at(bold, h)[0] for h in heads]
         self.assertEqual(ys, sorted(ys), "the sections in order")
         self.assertLess(ys[3], described, "the fields come under Details")
@@ -2342,8 +2412,8 @@ class SectionsOnScreen(unittest.TestCase):
         self.assert_under(lines, bold, "Sessions", "Printer fix", nxt["Sessions"])
         self.assert_under(lines, bold, "Handoffs", "Toner check", nxt["Handoffs"])
         self.assert_under(lines, bold, "Notes", "Driver shortlist", nxt["Notes"])
-        self.assert_under(lines, bold, "Stats", "This month", nxt["Stats"])
-        stats = next(l for l in lines[ys[4]:] if "This month" in l)
+        self.assert_under(lines, bold, "This month", "This month", nxt["This month"])
+        stats = next(l for l in lines[ys[4] + 1:] if "This month" in l)  # under its title, which is This month too
         self.assertRegex(stats, r"This month\s+\$1\.25 · 1 Sessions?")
 
     def test_a_projects_sub_projects_section_on_screen(self):
@@ -2371,7 +2441,7 @@ class SectionsOnScreen(unittest.TestCase):
         self.assertTrue(self.reads, "drawing the Projects tab didn't start the spend read")
         for when, want in (("loading", "loading…"), ("loaded", "This month")):
             lines, bold = seen[when]
-            self.assert_under(lines, bold, "Stats", want)
+            self.assert_under(lines, bold, "This month", want)
         self.assertFalse([l for l in seen["loaded"][0] if "loading…" in l])
 
 
@@ -2387,7 +2457,10 @@ class DetailItems(unittest.TestCase):
 
     @staticmethod
     def text_of(kind, item):
-        """The text an item's line shows: a sub-project's label, a Session's name, a Handoff's or note's title."""
+        """The text an item's line shows: Next's or Current state's title, a sub-project's label, a Session's
+        name, a Handoff's or note's title."""
+        if kind == "block":
+            return item
         if kind == "sub":
             return item.get("title") or item["slug"]
         return item["name"] if kind == "session" else item[1]
@@ -2726,7 +2799,7 @@ class DetailPane(unittest.TestCase):
     def test_a_click_on_a_line_that_isnt_an_item_does_nothing_harmful(self):
         before = self.fleet_items()
         W = roost.SIDEBAR_W
-        heading = next(i for i, l in enumerate(before["lines"]) if re.match(r"Handoffs\b", l[W:].strip()))
+        heading = next(i for i, l in enumerate(before["lines"]) if re.match(r"Handoffs\b", l[W:].strip(" ╭─")))
         seen = {}
         self.run_on(self.projects, [self.on_project("fleet"), lambda pilot: pilot.click(offset=(W + 6, heading)),
                                     self.state(seen, "heading")], size=self.SIZE)
@@ -2824,7 +2897,7 @@ class MoreProjects(unittest.TestCase):
     run_on, sidebar = ProjectRows.run_on, staticmethod(ProjectRows.sidebar)
     select, keys, proj = staticmethod(TextualScreens.select), staticmethod(TextualScreens.keys), staticmethod(TextualScreens.proj)
     detail_name = staticmethod(TwoPanes.detail_name)
-    SIZE = (120, 40)
+    SIZE = (120, 64)  # tall enough for every row, each project's two lines and the blank after them, unscrolled
     HOUR = 3600
     TOP = [f"Open {i:02d}" for i in range(10)]
     MORE = ["Open 10", "Open 11", "Shut a", "Shut b"]  # what More projects lists for the fixture, top to bottom
@@ -2860,14 +2933,22 @@ class MoreProjects(unittest.TestCase):
             c = ui.choosing
             seen[label] = {"lines": lines, "list": [l[:roost.SIDEBAR_W] for l in lines[1:len(lines) - bar - 1]],
                            "bold": bold_text(pilot.app), "dim": dim_text(pilot.app), "asking": ui.asking,
+                           "row_y": dict(getattr(ui, "prow_y", {})),
                            "menu": c and (c["title"], [o[0] for o in ui.choice_options() if not is_divider(o)])}
         return step
 
     @staticmethod
     def rows_of(got):
-        """The list's rows, top to bottom, as text: the selection bar and edges taken off, blank and rule lines left out."""
-        out = [l.strip(" ▌›│┃▏▕") for l in got["list"]]
-        return [l for l in out if l and not set(l) <= set("─ ")]
+        """The list's rows, top to bottom, as text: each row's first screen line (a project's name line, not its
+        second line), the selection bar and edges taken off. With no rows, the list's lines, blank and rule
+        lines left out."""
+        first = {}
+        for y, idx in sorted(got["row_y"].items()):
+            first.setdefault(idx, y)
+        if not first:
+            out = [l.strip(" ▌›│┃▏▕") for l in got["list"]]
+            return [l for l in out if l and not set(l) <= set("─ ")]
+        return [got["lines"][y][:roost.SIDEBAR_W].strip(" ▌›│┃▏▕") for y in sorted(first.values())]
 
     @staticmethod
     def on_more():
@@ -3294,9 +3375,10 @@ class StatsLines(unittest.TestCase):
 class DetailLayout(unittest.TestCase):
     """The details on a real screen (SectionsOnScreen's folder, with Current state and Next on Printer fleet, a
     Next alone on Restore drill, and bodies on Printer fleet's Handoffs: Toner swap, the newest, and Toner
-    check). One column at any width, its sections at most 80 columns wide: the name line, then Next and
-    Current state, Sub-projects, Sessions, Handoffs, Notes, Details, and Stats. Above the content are only the
-    top bar, a blank row, a rule, and a blank row; the list's first row and the name line are on screen row 4."""
+    check). One column at any width, its sections as wide as the details, one blank column short of the
+    window's right edge: the name line, then Next and Current state, Sub-projects, Sessions, Handoffs, Notes,
+    Details, and Stats. Above the content are only the top bar, a blank row, a rule, a blank row, the summary
+    strip, and a blank row; the list's first row and the name line are on screen row 6."""
     run_on, on_project = ProjectRows.run_on, ProjectRows.on_project
     select, keys, sidebar = staticmethod(TextualScreens.select), staticmethod(TextualScreens.keys), staticmethod(ProjectRows.sidebar)
     at, SIZE, WIDE, DESCRIPTION = staticmethod(TwoPanes.at), (120, 48), (180, 48), TwoPanes.DESCRIPTION
@@ -3335,14 +3417,16 @@ class DetailLayout(unittest.TestCase):
 
     @staticmethod
     def first_sidebar_row(lines):
-        """The first screen row under the top bar and its rule where the sidebar draws anything."""
+        """The first screen row under the top bar, its rule, and the summary strip where the sidebar draws anything."""
         side = ProjectRows.sidebar(lines)
-        return next((i for i in range(1, len(side)) if side[i].strip(" │┃▏▕─")), None)
+        return next((i for i in range(1, len(side)) if side[i].strip(" │┃▏▕─")
+                     and not re.search(r"●\s*\d+\s+running\b", lines[i])), None)
 
     @staticmethod
     def name_at(got):
-        """(y, x, text) of the detail pane's first bold run: the selected row's name."""
-        return min(((y, x, t) for y, x, t in got["bold"] if x >= roost.SIDEBAR_W and y > 0), default=None)
+        """(y, x, text) of the detail pane's first bold run: the selected row's name (the summary strip's bold
+        numbers and amounts left out)."""
+        return min(((y, x, t) for y, x, t in got["bold"] if x >= roost.SIDEBAR_W and y > 0 and not re.fullmatch(r"\$?[\d.,]+", t)), default=None)
 
     def bold_at(self, got, text):
         found = [(y, x) for y, x, t in got["bold"] if t == text and x >= roost.SIDEBAR_W]
@@ -3355,7 +3439,7 @@ class DetailLayout(unittest.TestCase):
 
     # 1. The top area
 
-    def test_only_the_top_bar_and_its_rule_are_above_the_content(self):
+    def test_only_the_top_bar_its_rule_and_the_summary_strip_are_above_the_content(self):
         seen = {}
         self.run_on(self.projects, [self.on_project("fleet"), self.grab(seen, "fleet")], size=self.SIZE)
         got = seen["fleet"]
@@ -3366,9 +3450,11 @@ class DetailLayout(unittest.TestCase):
         self.assertFalse([l for l in lines if re.search(r"\d+ projects · \d+ closed", l)], "no project counts")
         self.assertEqual(lines[2], "─" * self.SIZE[0], "a rule across the whole width under the top bar")
         self.assertEqual([l.strip(" │┃▏▕") for l in (lines[1], lines[3])], ["", ""], "a blank row each side of the rule")
-        self.assertEqual(self.first_sidebar_row(lines), 4, self.sidebar(lines)[:6])
+        self.assertRegex(lines[4], r"●\s*\d+\s+running\b", "the summary strip on row 4")
+        self.assertEqual(lines[5].strip(" │┃▏▕"), "", "a blank row under the strip")
+        self.assertEqual(self.first_sidebar_row(lines), 6, self.sidebar(lines)[:8])
         y, x, name = self.name_at(got)
-        self.assertEqual((y, name), (4, "Printer fleet"), "the name line is level with the sidebar's first row")
+        self.assertEqual((y, name), (6, "Printer fleet"), "the name line is level with the sidebar's first row")
         self.assertGreaterEqual(x, W)
 
     def test_the_search_row_shows_only_while_searching_or_with_a_search_set(self):
@@ -3376,12 +3462,12 @@ class DetailLayout(unittest.TestCase):
         self.run_on(self.projects, [self.on_project("fleet"), self.keys("/"), self.grab(seen, "typing"), self.keys("f", "l", "e"),
                                     self.keys("enter"), self.grab(seen, "kept"), self.keys("/", "escape"), self.grab(seen, "cleared")],
                     size=self.SIZE)
-        W, top = roost.SIDEBAR_W, slice(1, 7)  # the rows under the top bar (the key bar has a / too)
+        W, top = roost.SIDEBAR_W, slice(1, 9)  # the rows under the top bar (the key bar has a / too)
         self.assertTrue([l for l in seen["typing"]["lines"][top] if "/ " in l[W:]], "the search row, while typing")
         self.assertTrue([l for l in seen["kept"]["lines"][top] if "/ fle" in l[W:]], "the search row, with a search set")
         got = seen["cleared"]
         self.assertFalse([l for l in got["lines"][top] if "/ " in l[W:]], "no search row once it's cleared")
-        self.assertEqual(self.name_at(got)[0], 4, got["lines"][:6])
+        self.assertEqual(self.name_at(got)[0], 6, got["lines"][:8])
 
     def test_the_lists_first_row_is_on_the_same_screen_row_after_the_other_tabs(self):
         seen, shown = {}, []
@@ -3394,7 +3480,7 @@ class DetailLayout(unittest.TestCase):
         self.run_on(self.projects, steps, size=self.SIZE)
         self.assertEqual(shown, list(TABS[1:]) + ["Projects"], "round the other tabs and back")
         got = {k: self.first_sidebar_row(seen[k]["lines"]) for k in seen}
-        self.assertEqual(got, {"first": 4, "back": 4})
+        self.assertEqual(got, {"first": 6, "back": 6})
 
     # 2. The name line
 
@@ -3406,7 +3492,8 @@ class DetailLayout(unittest.TestCase):
             async def step(pilot):
                 pilot.app.redraw()
                 await pilot.pause()
-                y = min((y for y, x, t in bold_text(pilot.app) if x >= roost.SIDEBAR_W and y > 0), default=None)
+                y = min((y for y, x, t in bold_text(pilot.app)  # the strip's bold numbers and amounts left out
+                         if x >= roost.SIDEBAR_W and y > 0 and not re.fullmatch(r"\$?[\d.,]+", t)), default=None)
                 seen[(label, "runs")] = runs(pilot.app, y) if y else []
                 seen[(label, "fills")] = backgrounds(pilot.app, y, roost.SIDEBAR_W) if y else None
             return step
@@ -3445,32 +3532,36 @@ class DetailLayout(unittest.TestCase):
             self.run_on(self.projects, [self.on_project("fleet"), self.loaded, self.grab(seen, "fleet")], size=size)
             W, got = roost.SIDEBAR_W, seen["fleet"]
             lines = got["lines"]
-            name_y = self.name_at(got)[0]
-            ny, nx = self.bold_at(got, "Next")
-            sy, sx = self.bold_at(got, "Current state")
-            sessions_y, sessions_x = self.bold_at(got, "Sessions")
+            found = {b["title"]: b for b in boxes(lines, W)}
+            nxt, state, sessions = found.get("Next"), found.get("Current state"), found.get("Sessions")
             with self.subTest(size=size):
-                self.assertLess(name_y, ny)
-                self.assertLess(ny, sy, "Next first")
-                self.assertLess(sy, sessions_y, "before the sections")
-                self.assertEqual((nx, sx), (sessions_x, sessions_x), "one column: no column at the right")
-                self.assertLess(sy, self.field_y(got, "Folder"), "before the fields")
-                self.assertEqual(words(" ".join(l[W:] for l in lines[ny + 1:sy])), words(NEXT_TEXT))
-                self.assertEqual(words(" ".join(l[W:] for l in lines[sy + 1:sessions_y])), words(STATE_TEXT), "the whole text, wrapped")
-                self.assertGreater(sum(bool(l[W:].strip()) for l in lines[sy + 1:sessions_y]), 1, "wrapped over lines")
+                self.assertTrue(nxt and state and sessions, list(found))
+                self.assertLess(self.name_at(got)[0], nxt["top"])
+                self.assertEqual(nxt["top"], state["top"], "side by side")
+                self.assertLess(nxt["right"], state["left"], "Next first, at the left")
+                self.assertLess(state["bottom"], sessions["top"], "before the sections")
+                self.assertLess(state["bottom"], self.field_y(got, "│ Folder"), "before the fields")
+                self.assertEqual(words(" ".join(inside(lines, nxt))), words(NEXT_TEXT), "Next fits in 3 lines: all of it")
+                shown = [r.strip() for r in inside(lines, state) if r.strip()]
+                if size == self.SIZE:
+                    self.assertEqual(shown[-1], "… enter to expand", shown)
+                    self.assertIn(words(" ".join(shown[:-1])), words(STATE_TEXT), "its first lines, wrapped")
+                else:  # 180 columns: each half is wide enough for it in 3 lines
+                    self.assertEqual(words(" ".join(shown)), words(STATE_TEXT), "it fits in 3 lines: all of it")
+                self.assertEqual(len(shown), 3)
         seen = {}
         self.run_on(self.projects, [self.on_project("drill"), self.grab(seen, "drill"),
                                     self.on_project("quiet"), self.grab(seen, "quiet")], size=self.SIZE)
         W = roost.SIDEBAR_W
         drill = seen["drill"]
         self.assertFalse([t for y, x, t in drill["bold"] if t == "Current state"], "an empty one is left out")
-        dy, _ = self.bold_at(drill, "Next")
-        self.assertIn(words(DRILL_NEXT), words(" ".join(l[W:] for l in drill["lines"][dy + 1:dy + 4])))
+        dbox = next(b for b in boxes(drill["lines"], W) if b["title"] == "Next")
+        self.assertEqual(words(" ".join(inside(drill["lines"], dbox))), words(DRILL_NEXT))
         self.assertFalse([t for y, x, t in seen["quiet"]["bold"] if t in ("Current state", "Next") and x >= W])
 
     # 4. The sections, their headings, and their items
 
-    HEADS = ("Next", "Current state", "Sub-projects", "Sessions", "Handoffs", "Notes", "Details", "Stats")
+    HEADS = ("Next", "Current state", "Sub-projects", "Sessions", "Handoffs", "Notes", "Details", "This month")
 
     def heads(self, got):
         """{heading: (y, x)} for each of HEADS drawn bold in the details."""
@@ -3484,8 +3575,8 @@ class DetailLayout(unittest.TestCase):
         seen = {}
         self.run_on(self.projects, [self.on_project("fleet"), self.loaded, self.grab(seen, "fleet"),
                                     self.on_project("rollout"), self.grab(seen, "rollout")], size=self.SIZE)
-        for label, want in (("fleet", ["Next", "Current state", "Sessions", "Handoffs", "Notes", "Details", "Stats"]),
-                            ("rollout", ["Sub-projects", "Sessions", "Handoffs", "Notes", "Details", "Stats"])):
+        for label, want in (("fleet", ["Next", "Current state", "Sessions", "Handoffs", "Notes", "Details", "This month"]),
+                            ("rollout", ["Sub-projects", "Sessions", "Handoffs", "Notes", "Details", "This month"])):
             got = seen[label]
             heads = self.heads(got)
             with self.subTest(project=label):
@@ -3499,33 +3590,99 @@ class DetailLayout(unittest.TestCase):
         got = seen["fleet"]
         return got, {h: (y, x, got["lines"][y][x:]) for h, (y, x) in self.heads(got).items()}
 
-    def test_each_heading_is_bold_then_its_count_dim_then_a_rule_to_the_80_column_limit(self):
+    def test_each_heading_is_bold_then_its_count_dim_in_its_outlines_top_edge_to_the_details_right_edge(self):
         got, rows = self.heading_rows(self.WIDE)  # 180 columns: the details are far wider than 80
         W = roost.SIDEBAR_W
         counts = {"Sessions": 1, "Handoffs": 2, "Notes": 1}  # Printer fix; Toner swap and Toner check; Driver shortlist
         ends = {}
-        for head in ("Next", "Current state", "Sessions", "Handoffs", "Notes", "Details", "Stats"):
+        for head in ("Next", "Current state", "Sessions", "Handoffs", "Notes", "Details", "This month"):
             self.assertIn(head, rows, (head, rows))
             y, x, text = rows[head]
+            text = text[:text.index("╮") + 1] if "╮" in text else text
             with self.subTest(heading=head):
+                self.assertTrue(got["lines"][y][:x].endswith("╭─ "), got["lines"][y])
                 if head in counts:
-                    self.assertRegex(text, rf"^{head} {counts[head]} ─+$")
+                    self.assertRegex(text, rf"^{head} {counts[head]} ─+╮$")
                     n_at = x + len(head) + 1
                     self.assertTrue([t for yy, xx, t in got["dim"] if yy == y and xx == n_at and t.startswith(str(counts[head]))],
                                     f"the count is dim: {got['dim']}")
                 else:
-                    self.assertRegex(text, rf"^{head} ─+$", "no count: it lists no items")
+                    self.assertRegex(text, rf"^{head} ─+╮$", "no count: it lists no items")
                 ends[head] = x + len(text)
-                self.assertTrue(70 <= ends[head] - W <= 84, f"the rule stops at the 80-column limit: {ends[head] - W}")
-        self.assertEqual(len(set(ends.values())), 1, ends)
+        full = {h: e for h, e in ends.items() if h != "Next"}  # Next sits at the left of Current state
+        for head, end in full.items():
+            self.assertEqual(end, self.WIDE[0] - 1, f"{head}: the outline's ╮ one blank column short of the window's right edge")
+        self.assertEqual(len(set(full.values())), 1, ends)
+        self.assertLess(ends["Next"], rows["Current state"][1], "Next's outline ends before Current state's starts")
 
-    def test_the_sections_stay_within_80_columns_at_any_width(self):
+    def test_the_sections_leave_the_windows_last_column_blank_at_any_width(self):
         for size in (self.SIZE, self.WIDE):
             got, _ = self.heading_rows(size)
             W, bottom = roost.SIDEBAR_W, size[1] - 3  # above the status bar and the key bar
             with self.subTest(size=size):
-                for y, l in enumerate(got["lines"][4:bottom], 4):  # under the top bar, its rule, and their blank rows
-                    self.assertLessEqual(len(l.rstrip()) - W, 84, f"row {y} runs past 80 columns: {l[W:]!r}")
+                for y, l in enumerate(got["lines"][6:bottom], 6):  # under the top area and the summary strip, which spans the window
+                    self.assertLessEqual(len(l.rstrip()), size[0] - 1, f"row {y} runs into the window's last column: {l[W:]!r}")
+
+    def test_an_items_time_sits_at_its_outlines_right_edge_at_180_columns(self):
+        got, rows = self.heading_rows(self.WIDE)
+        lines = got["lines"]
+        fix = next(s for s in self.sessions if s["name"] == "Printer fix")
+        when = roost.short_when(fix["last"])
+        b = next(b for b in boxes(lines, roost.SIDEBAR_W) if b["title"] == "Sessions")
+        self.assertEqual(b["right"], self.WIDE[0] - 2, "the fixture: Sessions' outline runs to the window's right")
+        line = next(lines[y] for y in range(b["top"] + 1, b["bottom"]) if "Printer fix" in lines[y])
+        self.assertTrue(line[:b["right"]].rstrip().endswith(when), line)
+        self.assertEqual(len(line[:b["right"]].rstrip()), b["right"] - 2, f"two blanks between its time and the │: {line!r}")
+
+    LONG_NAME = ("Printer fleet consolidation for the north and south offices, with one driver package, "
+                 "and the toner orders moved")
+
+    def test_the_name_line_shows_a_long_name_whole_when_the_details_are_wide_enough(self):
+        next(p for p in self.projects if p["id"] == "fleet").update(label=self.LONG_NAME)
+        seen = {}
+        self.run_on(self.projects, [self.on_project("fleet"), self.grab(seen, "wide")], size=self.WIDE)
+        self.run_on(self.projects, [self.on_project("fleet"), self.grab(seen, "narrow")], size=(100, 48))
+        W = roost.SIDEBAR_W
+        self.assertGreater(len(self.LONG_NAME), 80, "the fixture: longer than the old 80-column limit")
+        wide = [l for l in seen["wide"]["lines"] if self.LONG_NAME in l[W:]]
+        self.assertEqual(len(wide), 1, "the whole name, unclipped, at 180 columns")
+        self.assertFalse([l for l in seen["narrow"]["lines"] if self.LONG_NAME in l[W:]], "clipped at 100 columns")
+        self.assertTrue([l for l in seen["narrow"]["lines"] if self.LONG_NAME[:40] in l[W:] and "…" in l], "clipped with …")
+
+    WIDE_DESCRIPTION = ("Move every office printer onto one driver package and retire the two oldest models "
+                        "before the quarter closes.")
+
+    def test_a_description_that_wraps_at_120_columns_fits_on_one_line_at_180(self):
+        next(p for p in self.projects if p["id"] == "fleet").update(summary=self.WIDE_DESCRIPTION)
+        W = roost.SIDEBAR_W
+        rows = {}
+        for size in (self.SIZE, self.WIDE):
+            got, heads = self.heading_rows(size)
+            under = [l[W:].strip(" │") for l in got["lines"][heads["Details"][0] + 1:heads["This month"][0]]]
+            at = next(i for i, l in enumerate(under) if l.startswith("Description"))
+            end = next(i for i in range(at + 1, len(under)) if re.match(r"(Repo|Category|Folder)\b", under[i]))
+            rows[size] = [under[at][len("Description"):].strip()] + under[at + 1:end]  # then the wrapped lines
+        self.assertGreater(len(rows[self.SIZE]), 1, ("the fixture: it wraps at 120 columns", rows[self.SIZE]))
+        self.assertEqual(rows[self.WIDE], [self.WIDE_DESCRIPTION], "one line, whole, at 180 columns")
+
+    LONG_DESCRIPTION = ("Move every office printer onto one driver package, retire the two oldest models, swap the "
+                        "toner on a schedule, label each tray by paper size, and keep a short log of jams so the "
+                        "worst units get replaced first when the budget allows it next spring.")
+
+    def test_every_wrapped_description_line_shows_whole_at_any_width(self):
+        # many widths, so some wrapped line fills the wrap width exactly
+        next(p for p in self.projects if p["id"] == "fleet").update(summary=self.LONG_DESCRIPTION)
+        W = roost.SIDEBAR_W
+        for cols in range(100, 171):  # from the narrowest window roost draws
+            got, heads = self.heading_rows((cols, 80))  # tall enough for Details and This month
+            under = [l[W:].strip(" │") for l in got["lines"][heads["Details"][0] + 1:heads["This month"][0]]]
+            at = next(i for i, l in enumerate(under) if l.startswith("Description"))
+            end = next(i for i in range(at + 1, len(under)) if re.match(r"(Repo|Category|Folder)\b", under[i]))
+            lines = [under[at][len("Description"):].strip()] + under[at + 1:end]
+            with self.subTest(cols=cols):
+                self.assertGreater(len(lines), 1, ("the fixture: it wraps", lines))
+                self.assertFalse([l for l in lines if "…" in l], ("no line clipped", lines))
+                self.assertEqual(" ".join(lines).split(), self.LONG_DESCRIPTION.split(), "every word, in order")
 
     def test_each_item_has_its_mark_its_name_and_its_time_at_the_sections_right_edge(self):
         toner = TextualScreens.closed("Toner order", 30)  # closed half an hour ago: in the last 7 days
@@ -3538,7 +3695,7 @@ class DetailLayout(unittest.TestCase):
         fleet = next(p for p in got["projects"] if p["id"] == "fleet")
         swap = next(h for h in fleet["handoffs"] if h[1] == "Toner swap")
         want = [("Sessions", "Printer fix", rf"● Printer fix\s+{re.escape(roost.short_when(fix['last']))}"),
-                ("Sessions", "Toner order", rf"○ Toner order\s+{re.escape(roost.short_when(toner['last']))}"),
+                ("Sessions", "Toner order", r"○ Toner order\s+closed, no Handoff"),  # closed, and no Handoff covers it
                 ("Handoffs", "Toner swap", rf"◆ Toner swap\s+{re.escape(roost.short_when(swap[0]))}"),
                 ("Notes", "Driver shortlist", r"✎ Driver shortlist(\s+\S.*)?")]
         for head, name, pattern in want:
@@ -3547,9 +3704,82 @@ class DetailLayout(unittest.TestCase):
                 y0 = rows[head][0]
                 line = next((l for l in lines[y0 + 1:] if name in l[W:]), None)
                 self.assertIsNotNone(line, (name, lines[y0:]))
-                self.assertRegex(line[W:].strip(), rf"^{pattern}$")
-                if head != "Notes":
-                    self.assertLessEqual(abs(len(line.rstrip()) - edge[head]), 1, f"its time at the section's right edge: {line!r}")
+                self.assertRegex(line[W:].strip(" │"), rf"^{pattern}$")
+                if head != "Notes":  # the time ends just inside the outline's right edge, its ╮ at edge - 1
+                    self.assertLessEqual(edge[head] - 1 - len(line.rstrip(" │")), 3, f"its time at the section's right edge: {line!r}")
+
+    def with_closed(self):
+        """Printer fleet also lists Toner order (closed half an hour ago, no Handoff covers it) and Old printer
+        audit (closed ten minutes ago, newer, and wrapped up: a Handoff covers it to its last message)."""
+        toner, old = TextualScreens.closed("Toner order", 30), TextualScreens.closed("Old printer audit", 10)
+        self.sessions += [toner, old]
+        fleet = next(p for p in self.projects if p["id"] == "fleet")
+        fleet["sessions"] = list(fleet["sessions"]) + [toner["id"], old["id"]]
+        fleet["covered"] = dict(fleet.get("covered") or {}, **{old["id"]: old["last"]})
+        return toner, old
+
+    def session_row(self, got, name):
+        """(y, the line) of the Sessions item that names name, or None."""
+        W, lines = roost.SIDEBAR_W, got["lines"]
+        y0 = self.heads(got)["Sessions"][0]
+        return next(((y, l) for y, l in enumerate(lines[y0 + 1:], y0 + 1) if name in l[W:]), None)
+
+    def wrapped_seen(self, seen, s):
+        """A step that keeps, as seen["wrapped"], whether Printer fleet's Handoffs cover Session s."""
+        def look(ui):
+            seen["wrapped"] = ui.wrapped_up(next(p for p in ui.projects if p["id"] == "fleet"), s)
+        return self.select(look)
+
+    def dim_in_row(self, got, y, text):
+        return [t for yy, xx, t in got["dim"] if yy == y and xx >= roost.SIDEBAR_W and text in t]
+
+    def test_a_closed_session_no_handoff_covers_is_dim_and_says_so_where_the_time_goes(self):
+        toner, old = self.with_closed()
+        seen = {}
+        self.run_on(self.projects, [self.on_project("fleet"), self.loaded, self.wrapped_seen(seen, toner), self.grab(seen, "fleet")],
+                    size=self.SIZE)
+        got = seen["fleet"]
+        self.assertFalse(seen["wrapped"])  # the fixture
+        found = self.session_row(got, "Toner order")
+        self.assertIsNotNone(found, got["lines"])
+        y, line = found
+        W = roost.SIDEBAR_W
+        self.assertRegex(line[W:].strip(" │"), r"^○ Toner order\s+closed, no Handoff$")
+        self.assertNotIn(roost.short_when(toner["last"]), line[W:], "no time on it")
+        self.assertTrue(self.dim_in_row(got, y, "○"), f"○ is dim: {got['dim']}")
+        self.assertTrue(self.dim_in_row(got, y, "Toner order"), f"its name is dim: {got['dim']}")
+        self.assertTrue(self.dim_in_row(got, y, "closed, no Handoff"), f"closed, no Handoff is dim: {got['dim']}")
+        fix = self.session_row(got, "Printer fix")
+        self.assertIsNotNone(fix, got["lines"])
+        self.assertLess(fix[0], y, "running ones first")
+        self.assertFalse(self.dim_in_row(got, fix[0], "Printer fix"), "a running one's name isn't dim")
+        last = next(s for s in self.sessions if s["name"] == "Printer fix")["last"]
+        self.assertRegex(fix[1][W:].strip(" │"), rf"^● Printer fix\s+{re.escape(roost.short_when(last))}$")
+
+    def test_a_wrapped_closed_session_gets_no_row_and_isnt_counted(self):
+        toner, old = self.with_closed()
+        seen = {}
+        self.run_on(self.projects, [self.on_project("fleet"), self.loaded, self.wrapped_seen(seen, old), self.grab(seen, "fleet")],
+                    size=self.WIDE)
+        got = seen["fleet"]
+        self.assertTrue(seen["wrapped"])  # the fixture
+        self.assertIsNone(self.session_row(got, "Old printer audit"), got["lines"])
+        self.assertEqual([x["name"] for k, x in got["items"] if k == "session"], ["Printer fix", "Toner order"])
+        y, x = self.heads(got)["Sessions"]
+        self.assertRegex(got["lines"][y][x:], r"^Sessions 2 ─+╮", "Printer fix and Toner order: 2")
+
+    def test_a_selected_closed_session_keeps_the_bold_green_name(self):
+        self.with_closed()
+        seen = {}
+        self.run_on(self.projects, [self.on_project("fleet"), self.loaded, self.keys("right"),
+                                    self.index_of("session", "Toner order"), self.grab(seen, "picked")], size=self.SIZE)
+        got = seen["picked"]
+        found = self.session_row(got, "Toner order")
+        self.assertIsNotNone(found, got["lines"])
+        y, _ = found
+        self.assertIn(y, got["selected"], "drawn selected: ▌ and its name bold green")
+        self.assertTrue([t for yy, xx, t in got["bold"] if yy == y and "Toner order" in t], got["bold"])
+        self.assertFalse(self.dim_in_row(got, y, "Toner order"), "not dim while selected")
 
     def test_a_sub_projects_line_has_its_mark_name_type_and_state_at_the_right(self):
         seen = {}
@@ -3559,7 +3789,7 @@ class DetailLayout(unittest.TestCase):
         y0 = self.heads(got)["Sub-projects"][0]
         rollout = next(p for p in got["projects"] if p["id"] == "rollout")
         beta = next(s for s in rollout["subs"] if s["slug"] == "beta")
-        sub_lines = [l[W:].strip() for l in lines[y0 + 1:y0 + 3]]
+        sub_lines = [l[W:].strip(" │") for l in lines[y0 + 1:y0 + 3]]
         self.assertRegex(sub_lines[0], r"^● Badge Printers\s+feature\s+running$")
         self.assertRegex(sub_lines[1], rf"^◆ beta\s+feature\s+ready · Handoff {re.escape(roost.short_when(beta['handed']))}$")
 
@@ -3569,7 +3799,7 @@ class DetailLayout(unittest.TestCase):
             self.run_on(self.projects, [self.on_project(pid), self.loaded, self.grab(seen, pid)], size=self.SIZE)
             got = seen[pid]
             W, heads = roost.SIDEBAR_W, self.heads(got)
-            under = [l[W:].strip() for l in got["lines"][heads["Details"][0] + 1:heads["Stats"][0]] if l[W:].strip()]
+            under = [l[W:].strip(" │╰─╯") for l in got["lines"][heads["Details"][0] + 1:heads["This month"][0]] if l[W:].strip(" │╰─╯")]
             project = next(p for p in got["projects"] if p["id"] == pid)
             with self.subTest(project=pid):
                 self.assertTrue(under and under[0].startswith("Description"), under)
@@ -3585,8 +3815,8 @@ class DetailLayout(unittest.TestCase):
 
     def test_stats_is_this_months_spend_and_sessions_then_the_last_30_days_with_no_sparkline(self):
         got, rows = self.heading_rows(self.SIZE)
-        W, y0 = roost.SIDEBAR_W, rows["Stats"][0]
-        lines = [l[W:].strip() for l in got["lines"][y0 + 1:]]
+        W, y0 = roost.SIDEBAR_W, rows["This month"][0]
+        lines = [l[W:].strip(" │") for l in got["lines"][y0 + 1:]]
         at = next((i for i, l in enumerate(lines) if "This month" in l), None)
         self.assertIsNotNone(at, lines)
         self.assertRegex(lines[at], r"^This month\s+\$1\.25 · 1 Sessions?$")
@@ -3598,7 +3828,7 @@ class DetailLayout(unittest.TestCase):
         selects it."""
         seen, W = {}, roost.SIDEBAR_W
         steps = [self.on_project("fleet"), self.loaded, self.grab(seen, "side"), self.keys("right")]
-        for i in range(4):
+        for i in range(6):
             steps += [self.grab(seen, i), self.keys("down")]
         self.run_on(self.projects, steps, size=size)
         got = seen["side"]
@@ -3609,10 +3839,11 @@ class DetailLayout(unittest.TestCase):
             y = next((i for i in range(last, len(got["lines"])) if t in got["lines"][i][W:]), None)
             self.assertIsNotNone(y, (t, got["lines"]))
             ys.append(y)
-            last = y + 1
-        self.assertEqual(len(ys), 4, got["items"])  # Printer fix, Toner swap, Toner check, Driver shortlist
-        for i in range(4):
-            self.assertEqual(seen[i]["selected"] & set(ys), {ys[i]}, (size, i, seen[i]["lines"][ys[i]]))
+            last = y if kind == "block" else y + 1  # Next and Current state share a row
+        self.assertEqual([k for k, _ in got["items"]], ["block", "block", "session", "handoff", "handoff", "note"])
+        for i in range(6):  # Next and Current state: no ▌ (their outline turns green); then each item's ▌
+            want = set() if got["items"][i][0] == "block" else {ys[i]}
+            self.assertEqual(seen[i]["selected"] & set(ys), want, (size, i, seen[i]["lines"][ys[i]]))
         note = next(i for i, (k, _) in enumerate(got["items"]) if k == "note")
         clicked = {}
         self.run_on(self.projects, [self.on_project("fleet"), self.loaded,
@@ -3754,9 +3985,9 @@ class DetailScroll(unittest.TestCase):
         for i in range(len(full)):
             steps += [self.wheel(roost.ProjectPanel), self.view(seen, i)]
         self.run_on(self.projects, steps, size=self.SHORT)
-        heads = {"Next", "Current state", "Sessions", "Handoffs", "Notes", "Details", "Stats"}
+        heads = {"Next", "Current state", "Sessions", "Handoffs", "Notes", "Details", "This month"}
         W = roost.SIDEBAR_W
-        self.assertNotIn("Stats", {t for y, x, t in seen["start"]["bold"] if x >= W}, "the fixture: Stats is cut off at first")
+        self.assertNotIn("This month", {t for y, x, t in seen["start"]["bold"] if x >= W}, "the fixture: This month is cut off at first")
         shown = {t for v in seen.values() for y, x, t in v["bold"] if x >= W and t in heads}
         self.assertEqual(shown, heads, "every section shows at some scroll position")
         last = seen[len(full) - 1]
@@ -3802,7 +4033,7 @@ class DetailScroll(unittest.TestCase):
                 self.assertEqual(self.norm(got["pane"][-1]), full[-1])
 
     def test_with_the_keys_in_the_details_down_keeps_the_selected_item_on_screen(self):
-        seen, n = {}, 9  # Printer fix; three Handoffs; five notes
+        seen, n = {}, 11  # Next, Current state; Printer fix; three Handoffs; five notes
         steps = [self.on_project("fleet"), self.loaded, self.view(seen, "list"), self.keys("right"), self.view(seen, 0)]
         for i in range(1, n):
             steps += [self.keys("down"), self.view(seen, i)]
@@ -3812,6 +4043,10 @@ class DetailScroll(unittest.TestCase):
             got = seen[i]
             with self.subTest(dsel=i):
                 self.assertEqual(got["dsel"], i)
+                if i < 2:  # Next and Current state: marked by their outline, no ▌; their title on screen
+                    title = ("Next", "Current state")[i]
+                    self.assertTrue([l for l in got["pane"] if f"╭─ {title}" in l], got["pane"])
+                    continue
                 self.assertEqual(len(got["selected"]), 1, f"the selected item is on screen: {got['pane']}")
         last = self.norm(seen[n - 1]["lines"][min(seen[n - 1]["selected"])][roost.SIDEBAR_W:])
         self.assertNotIn(last, [self.norm(l) for l in seen["list"]["pane"]], "the fixture: the last item is below the window at first")
@@ -3819,7 +4054,7 @@ class DetailScroll(unittest.TestCase):
     def test_page_down_and_up_scroll_by_the_height_less_one_row_and_leave_the_selection(self):
         full = self.full()
         seen = {}
-        self.run_on(self.projects, [self.on_project("fleet"), self.loaded, self.keys("right"), self.view(seen, "top"),
+        self.run_on(self.projects, [self.on_project("fleet"), self.loaded, self.keys("right", "down", "down"), self.view(seen, "top"),
                                     self.keys("pagedown"), self.view(seen, "down"), self.keys("pageup"), self.view(seen, "up"),
                                     self.keys("pagedown"), self.keys("down"), self.view(seen, "moved")], size=self.SHORT)
         room = len(seen["top"]["pane"])
@@ -3827,10 +4062,11 @@ class DetailScroll(unittest.TestCase):
         self.assertEqual(self.offset(seen["top"], full), 0)
         self.assertEqual(self.offset(seen["down"], full), room - 1, "a page is the details' height less one row")
         self.assertEqual(self.offset(seen["up"], full), 0)
-        self.assertEqual((seen["down"]["dsel"], seen["up"]["dsel"]), (0, 0), "paging leaves the selected item")
+        self.assertEqual(seen["top"]["dsel"], 2, "the fixture: past Next and Current state, on Printer fix")
+        self.assertEqual((seen["down"]["dsel"], seen["up"]["dsel"]), (2, 2), "paging leaves the selected item")
         self.assertEqual(seen["down"]["selected"], set(), "the fixture: the page down scrolled the selected item off")
         got = seen["moved"]
-        self.assertEqual(got["dsel"], 1, "↓ after paging moves the selection on by one")
+        self.assertEqual(got["dsel"], 3, "↓ after paging moves the selection on by one")
         self.assertEqual(len(got["selected"]), 1, "and the view comes back to show it")
 
     def test_more_below_ends_the_last_row_in_a_dim_more_marker_and_none_when_it_all_shows(self):
@@ -3841,7 +4077,7 @@ class DetailScroll(unittest.TestCase):
         W, top = roost.SIDEBAR_W, seen["top"]
         last_y = top["y0"] + len(top["pane"]) - 1
         row = top["lines"][last_y]
-        self.assertTrue(row.rstrip().endswith("↓ more"), f"the last row: {row!r}")
+        self.assertTrue(row.rstrip(" │").endswith("↓ more"), f"the last row: {row!r}")
         self.assertLessEqual(len(row.rstrip()) - W, 84, "within the details' 80 columns")
         self.assertTrue([t for y, x, t in top["dim"] if y == last_y and t.endswith("↓ more")], "it's dim")
         self.assertEqual(sum("↓ more" in l for l in top["pane"]), 1, "only on the last row")
@@ -3885,3 +4121,689 @@ class DetailScroll(unittest.TestCase):
         self.assertIn("page up/down", bar, "the key bar names the paging keys")
         self.assertTrue([(a, b) for a, b in got["help"] if "scroll" in b.lower() and "details" in (a + b).lower()],
                         f"the Projects help mentions scrolling the details: {got['help']}")
+
+
+STRIP_Y = 4  # the summary strip's row: under the top bar, a blank row, the rule, and a blank row
+
+
+def strip_runs(app, y=STRIP_Y):
+    """The strip's row: its text, and (x, text, style) for each run."""
+    return screen_text(app)[y], runs(app, y)
+
+
+@unittest.skipUnless(roost.App, "Textual isn't installed here: run the tests with ~/.roost/venv/bin/python")
+class ProjectsStrip(unittest.TestCase):
+    """The Projects tab's summary strip (TwoPanes' folder: Printer fleet ●, Restore drill ◆, Badge rollout ● ◆),
+    on row 4 with a blank row under it: ● N running, ◆ N ready to pick up, $X.XX today, $X.XX this month, the
+    numbers bold, the words dim, no background. The spend is all of it, as the Stats tab totals it; until it's
+    read, the spend parts are left out. A count of 0 still shows."""
+    run_on, on_project = ProjectRows.run_on, ProjectRows.on_project
+    select, keys = staticmethod(TextualScreens.select), staticmethod(TextualScreens.keys)
+    SIZE, DESCRIPTION, loaded = TwoPanes.SIZE, TwoPanes.DESCRIPTION, staticmethod(SectionsOnScreen.loaded)
+    W = importlib.import_module("roost.app.widgets")
+    PARTS = re.compile(r"●\s*(\d+)\s+running\b.*◆\s*(\d+)\s+ready to pick up\b(.*)$")
+
+    def setUp(self):
+        """TwoPanes' folder, and spend: today $1.25 on Printer fleet, $0.50 on no project, $0.25 of wrap-ups;
+        on the 1st of the month $2.00 (when that isn't today); last month $9.00."""
+        import threading, unittest.mock
+        TwoPanes.setUp(self)
+        today = date.today()
+        first, before = today.replace(day=1), today.replace(day=1) - timedelta(days=1)
+        rows = [(today.isoformat(), "Live work", "zz000000-0000", "fleet", 1.25),
+                (today.isoformat(), "Live work", "yy000000-0000", None, 0.50),
+                (today.isoformat(), "Wrap-ups", "xx000000-0000", None, 0.25),
+                (before.isoformat(), "Live work", "ww000000-0000", "fleet", 9.00)]
+        if first != today:
+            rows.append((first.isoformat(), "Live work", "vv000000-0000", None, 2.00))
+        self.today, self.month = "$2.00", "$2.00" if first == today else "$4.00"
+        self.release = threading.Event()
+        self.release.set()
+        self.addCleanup(self.release.set)
+
+        def gather(table=None, now=None):
+            self.release.wait(10)
+            return {"rows": list(rows), "hours": {}, "tokens": {}, "unpriced": [], "priced": True}
+        patcher = unittest.mock.patch.object(importlib.import_module("roost.core.statsdata"), "gather_spend", gather)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def strip(self, seen, label):
+        async def step(pilot):
+            pilot.app.redraw()
+            await pilot.pause()
+            app = pilot.app
+            text, rs = strip_runs(app)
+            seen[label] = {"text": text, "runs": rs, "fills": backgrounds(app, STRIP_Y), "lines": screen_text(app),
+                           "running": app.ui.status_line()[1]}
+        return step
+
+    def styles_of(self, got, word):
+        """The styles of each character of the first run of word on the strip."""
+        x = got["text"].index(word)
+        return [st for x0, text, st in got["runs"] for i, ch in enumerate(text) if x <= x0 + i < x + len(word)]
+
+    def test_the_strip_reads_running_ready_today_and_this_month_in_order(self):
+        seen = {}
+        self.run_on(self.projects, [self.on_project("fleet"), self.loaded, self.strip(seen, "x")], size=self.SIZE)
+        got = seen["x"]
+        m = self.PARTS.search(got["text"])
+        self.assertIsNotNone(m, f"the strip on row {STRIP_Y}: {got['lines'][:7]}")
+        running = re.match(r"(\d+) running", got["running"])
+        self.assertEqual(m.group(1), running.group(1) if running else "0", "the running count, as the status bar's")
+        self.assertEqual(m.group(2), "2", "Restore drill and Badge rollout show ◆")
+        self.assertRegex(m.group(3), rf"^\W*{re.escape(self.today)}\s+today\b.*{re.escape(self.month)}\s+this month\s*$",
+                         "today's spend, then this month's, all of it as the Stats tab totals it")
+
+    def test_the_strips_numbers_are_bold_its_words_dim_its_marks_colored_and_it_has_no_fill(self):
+        seen = {}
+        self.run_on(self.projects, [self.on_project("fleet"), self.loaded, self.strip(seen, "x")], size=self.SIZE)
+        got = seen["x"]
+        self.assertIn("ready to pick up", got["text"], got["lines"][:7])
+        green, yellow, muted = self.W.GREEN.lower(), self.W.YELLOW.lower(), self.W.MUTED.lower()
+        self.assertEqual({color_of(st) for st in self.styles_of(got, "●")}, {green})
+        self.assertEqual({color_of(st) for st in self.styles_of(got, "◆")}, {yellow})
+        for word in ("running", "ready to pick up", "today", "this month"):
+            with self.subTest(word=word):
+                self.assertEqual({color_of(st) for st in self.styles_of(got, word) if st}, {muted}, f"{word} is dim")
+        for number in re.findall(r"\$\d+\.\d\d|(?<![\w$.])\d+(?![\w.])", got["text"]):
+            with self.subTest(number=number):
+                self.assertTrue(all(st and st.bold for st in self.styles_of(got, number)), f"{number} is bold")
+        self.assertEqual(got["fills"], set(), "no background on the strip")
+
+    def test_until_the_spend_is_read_the_spend_parts_are_left_out(self):
+        seen = {}
+        self.release.clear()  # the read waits until the test lets it finish
+
+        async def finish(pilot):
+            self.release.set()
+        self.run_on(self.projects, [self.on_project("fleet"), self.strip(seen, "loading"), finish, self.loaded,
+                                    self.strip(seen, "loaded")], size=self.SIZE)
+        got = seen["loading"]
+        self.assertRegex(got["text"], r"●\s*\d+\s+running\b.*◆\s*\d+\s+ready to pick up\s*$", "running and ready only")
+        self.assertNotIn("loading", got["text"].lower())
+        self.assertNotIn("$", got["text"])
+        self.assertIn("this month", seen["loaded"]["text"])
+
+    def test_a_count_of_zero_still_shows(self):
+        seen = {}
+        self.sessions = []
+        quiet = [p for p in self.projects if p["id"] == "quiet"]
+        self.run_on(quiet, [self.loaded, self.strip(seen, "x")], size=self.SIZE)
+        m = self.PARTS.search(seen["x"]["text"])
+        self.assertIsNotNone(m, seen["x"]["lines"][:7])
+        self.assertEqual((m.group(1), m.group(2)), ("0", "0"))
+
+    # Centered: the blank columns before the strip and after it differ by at most 1, across the whole width.
+
+    WIDE = (151, 40)  # wider than SIZE, and odd
+    ORDER = re.compile(r"^● \d+ running {5}◆ \d+ ready to pick up {5}\$\d+\.\d\d today {5}\$\d+\.\d\d this month$")
+
+    def placed(self, seen, label):
+        """The strip step, plus the strip's blank columns before and after it and the screen's width."""
+        async def step(pilot):
+            await self.strip(seen, label)(pilot)
+            seen[label]["gaps"], seen[label]["width"] = row_gaps(pilot.app, STRIP_Y), pilot.app.size.width
+        return step
+
+    def assertCentered(self, got):
+        before, after = got["gaps"]
+        self.assertLessEqual(abs(before - after), 1, f"{before} blank columns before the strip and {after} after it, "
+                                                     f"{got['width']} wide: {got['text']!r}")
+
+    def test_the_strip_is_centered_across_the_whole_width(self):
+        for size in (self.SIZE, self.WIDE):
+            seen = {}
+            self.run_on(self.projects, [self.on_project("fleet"), self.loaded, self.placed(seen, "x")], size=size)
+            got = seen["x"]
+            with self.subTest(width=size[0]):
+                self.assertIsNotNone(self.PARTS.search(got["text"]), f"the strip on row {STRIP_Y}: {got['lines'][:7]}")
+                self.assertCentered(got)
+                self.assertRegex(got["text"].strip(), self.ORDER, "the parts in order, five blank columns between them")
+
+    def test_the_strip_stays_centered_before_the_spend_is_read(self):
+        seen = {}
+        self.release.clear()  # the read waits until the test lets it finish
+
+        async def finish(pilot):
+            self.release.set()
+        self.run_on(self.projects, [self.on_project("fleet"), self.placed(seen, "loading"), finish, self.loaded,
+                                    self.placed(seen, "loaded")], size=self.SIZE)
+        self.assertNotIn("$", seen["loading"]["text"], "the fixture: the spend not read yet")
+        self.assertIn("this month", seen["loaded"]["text"], "the fixture: the spend read")
+        for when in ("loading", "loaded"):
+            with self.subTest(when=when):
+                self.assertCentered(seen[when])
+        self.assertRegex(seen["loading"]["text"].strip(), r"^● \d+ running {5}◆ \d+ ready to pick up$")
+
+    def test_on_a_screen_too_narrow_to_center_it_the_strip_starts_at_column_2(self):
+        """The screens need MIN_SIZE, wider than today's strip, so the strip gets one more, long part here: wider
+        than the screen, it can't fit centered."""
+        import unittest.mock
+        tab = importlib.import_module("roost.tabs.projects").ProjectsTab
+        real, long = tab.projects_strip, "x" * 40
+
+        def longer(ui):
+            return list(real(ui)) + [("", 0, "9", long)]
+        seen = {}
+        with unittest.mock.patch.object(tab, "projects_strip", longer):
+            self.run_on(self.projects, [self.on_project("fleet"), self.loaded, self.placed(seen, "x")],
+                        size=self.W.MIN_SIZE)
+        got = seen["x"]
+        self.assertIn("this month", got["text"], "the fixture: the spend read")
+        self.assertEqual(got["gaps"][0], 2, f"two blank columns before the strip: {got['text']!r}")
+        self.assertRegex(got["text"], r"^  ● \d+ running {5}◆", "the strip from its first part, unclipped at the left")
+        self.assertGreater(len(got["text"]) + 4, got["width"], f"the fixture: the strip doesn't fit centered: {got['text']!r}")
+
+
+@unittest.skipUnless(roost.App, "Textual isn't installed here: run the tests with ~/.roost/venv/bin/python")
+class ListTwoLines(unittest.TestCase):
+    """Each project in the Projects list takes two rows: its name (marks at the right), then a dim line at the
+    name's column: its status, "N running" when its Sessions or its open sub-projects' run, and when it was last
+    worked, joined by " · ", an empty part left out. A blank row before the next project. More projects and
+    + New project keep one row. The ▌ marks both rows of the selected project; a click on either selects it;
+    ↑↓ move a project at a time."""
+    run_on, on_project, chosen = ProjectRows.run_on, ProjectRows.on_project, staticmethod(ProjectRows.chosen)
+    select, keys, sidebar = staticmethod(TextualScreens.select), staticmethod(TextualScreens.keys), staticmethod(ProjectRows.sidebar)
+    SIZE, DESCRIPTION, setUp = TwoPanes.SIZE, TwoPanes.DESCRIPTION, TwoPanes.setUp
+    proj, HOUR, fixture = staticmethod(TextualScreens.proj), MoreProjects.HOUR, MoreProjects.fixture
+    LABELS = {"fleet": "Printer fleet", "drill": "Restore drill", "quiet": "Quiet one", "rollout": "Badge rollout"}
+    RUNNING = {"fleet": 1, "rollout": 1}  # Printer fix; Badge Printers' Laptop refresh
+
+    def look(self, seen, label):
+        async def step(pilot):
+            pilot.app.redraw()
+            await pilot.pause()
+            app = pilot.app
+            lines = screen_text(app)
+            seen[label] = {"side": self.sidebar(lines), "dim": dim_text(app), "chosen": self.chosen(app),
+                           "bars": {y: color_of(style_at(app, y, 0)) for y, l in enumerate(lines) if l[:1] == "▌"}}
+        return step
+
+    def want(self, p):
+        parts = [p.get("status") or "", f"{self.RUNNING[p['id']]} running" if self.RUNNING.get(p["id"]) else "",
+                 roost.short_when(p["last"]) if p.get("last") else ""]
+        return " · ".join(x for x in parts if x)
+
+    @staticmethod
+    def y_of(side, label):
+        return next((i for i, l in enumerate(side) if re.search(rf"(^|\s){re.escape(label)}(\s|$)", l)), None)
+
+    def test_each_project_has_a_dim_second_line_of_status_running_and_when_at_its_names_column(self):
+        seen = {}
+        self.run_on(self.projects, [self.on_project("quiet"), self.look(seen, "x")], size=self.SIZE)
+        side, dim = seen["x"]["side"], seen["x"]["dim"]
+        for pid, label in self.LABELS.items():
+            p = next(p for p in self.projects if p["id"] == pid)
+            with self.subTest(project=label):
+                y = self.y_of(side, label)
+                self.assertIsNotNone(y, side)
+                x = side[y].index(label)
+                second = side[y + 1].rstrip(" │┃▏▕")
+                self.assertEqual(len(second) - len(second.lstrip(" ▌")), x, f"at the name's column: {side[y:y + 2]}")
+                shown, want = second[x:], self.want(p)
+                if shown.endswith("…"):  # cut at the list's edge
+                    self.assertTrue(want.startswith(shown[:-1]) and len(shown) > 1, (shown, want))
+                else:
+                    self.assertEqual(shown, want)
+                self.assertTrue([t for yy, xx, t in dim if yy == y + 1 and xx == x], f"the second line is dim: {side[y + 1]!r}")
+
+    def test_a_blank_row_follows_each_projects_two_lines_and_more_and_new_keep_one_row(self):
+        seen = {}
+        self.run_on(self.projects, [self.on_project("quiet"), self.look(seen, "x")], size=self.SIZE)
+        side = [l.strip(" ▌│┃▏▕") for l in seen["x"]["side"]]
+        ys = sorted(self.y_of(side, label) for label in self.LABELS.values())
+        for y in ys:
+            self.assertEqual(side[y + 2], "", f"a blank row after the project's two lines: {side[y:y + 3]}")
+        more, new = self.y_of(side, "More projects"), self.y_of(side, "+ New project")
+        self.assertIsNotNone(more, side)
+        self.assertIsNotNone(new, side)
+        for y, label in ((more, "More projects"), (new, "+ New project")):
+            with self.subTest(row=label):
+                after = side[y + 1] if y + 1 < len(side) else ""
+                self.assertTrue(after == "" or "+ New project" in after, f"{label} keeps one row: {side[y:y + 2]}")
+
+    def test_the_bar_marks_both_rows_of_the_selected_project(self):
+        seen = {}
+        self.run_on(self.projects, [self.on_project("drill"), self.look(seen, "list"), self.keys("right"),
+                                    self.look(seen, "details")], size=self.SIZE)
+        green, muted = roost.GREEN.lower(), roost.MUTED.lower()
+        y = self.y_of(seen["list"]["side"], "Restore drill")
+        for when, color in (("list", green), ("details", muted)):
+            with self.subTest(keys_in=when):
+                self.assertEqual(seen[when]["bars"], {y: color, y + 1: color}, seen[when]["side"][y - 1:y + 3])
+
+    def test_a_click_on_either_row_selects_the_project(self):
+        seen = {}
+        self.run_on(self.projects, [self.on_project("quiet"), self.look(seen, "x")], size=self.SIZE)
+        y = self.y_of(seen["x"]["side"], "Restore drill")
+        for dy in (0, 1):
+            got = {}
+            self.run_on(self.projects, [self.on_project("quiet"), lambda pilot, dy=dy: pilot.click(offset=(8, y + dy)),
+                                        self.look(got, "x")], size=self.SIZE)
+            with self.subTest(row=dy + 1):
+                self.assertEqual(got["x"]["chosen"], "drill")
+
+    def test_up_and_down_move_one_project_at_a_time_and_keep_both_rows_on_screen(self):
+        self.projects = self.fixture(12, 2)  # Open 00 … Open 11, Shut a, Shut b: far more than 100x28 shows
+        seen = {}
+        steps = [self.look(seen, 0)]
+        for i in range(1, 11):
+            steps += [self.keys("down"), self.look(seen, i)]
+        self.run_on(self.projects, steps, size=(100, 28))
+        self.assertEqual([seen[i]["chosen"] for i in range(11)], [f"open-{i:02d}" for i in range(10)] + ["more"])
+        for i in range(10):
+            with self.subTest(project=f"Open {i:02d}"):
+                bars = sorted(seen[i]["bars"])
+                self.assertEqual(len(bars), 2, seen[i]["side"])
+                self.assertEqual(bars[1], bars[0] + 1)
+                self.assertIn(f"Open {i:02d}", seen[i]["side"][bars[0]], "the name, then its second line")
+
+
+LINE_COLOR = "#3a4049"  # every rule and outline roost draws in its line colour, and the list's divider
+PANEL_NEXT = ["Book the printer swap.", "Call the toner vendor.", "Order spare drums."]  # three short lines: all of it shows
+PANEL_STATE = ("Drivers are packaged for both offices. The north office already runs on the new toner supplier. "
+               "The south office waits on a vendor quote before its printers move over. Two of the oldest models "
+               "are retired and recycled. The badge printers stay on the old driver until the spring refresh, "
+               "when the last of the leased units go back to the vendor.")
+STATE_END = "go back to the vendor."
+
+
+def boxes(lines, x0=0):
+    """The rounded outlines drawn at or right of column x0, top to bottom: {title, count, top, bottom, left,
+    right} each, title and count read from the top edge (╭─ Title N ───╮)."""
+    out = []
+    for y, line in enumerate(lines):
+        for m in re.finditer("╭", line):
+            left = m.start()
+            if left < x0:
+                continue
+            right = line.find("╮", left)
+            if right < 0:
+                continue
+            bottom = next((yy for yy in range(y + 1, len(lines)) if len(lines[yy]) > left and lines[yy][left] == "╰"), None)
+            head = line[left + 1:right].strip("─ ")
+            m2 = re.fullmatch(r"(.*?)(?:\s+(\d+))?", head)
+            out.append({"title": m2.group(1).strip("─ "), "count": m2.group(2), "top": y, "bottom": bottom,
+                        "left": left, "right": right})
+    return sorted(out, key=lambda b: (b["top"], b["left"]))
+
+
+def inside(lines, box):
+    """The text rows inside an outline, between its │ edges."""
+    return [lines[y][box["left"] + 1:box["right"]] for y in range(box["top"] + 1, box["bottom"])]
+
+
+@unittest.skipUnless(roost.App, "Textual isn't installed here: run the tests with ~/.roost/venv/bin/python")
+class DetailPanels(unittest.TestCase):
+    """The details as rounded outlines (SectionsOnScreen's folder; Printer fleet's Next is three short lines and
+    its Current state a long paragraph; Restore drill has a Next alone): one per section, as wide as the details
+    (one blank column short of the window's right edge), titled in their top edge (the title bold, its count
+    dim), in the line colour, the content two columns in. Next and Current state side by side when both have
+    text, the same height, splitting the width; each shows all of a text that fits in 3 lines, else 2 lines and
+    a dim "… enter to expand". With the keys in the details they're
+    the first items: selected, the outline and title turn green, with no ▌; enter expands one to the full width
+    and all its text, "enter to collapse" dim at the right, the other below it collapsed; enter collapses it.
+    The key bar says enter expand or collapse. Another project shows nothing expanded. No fills."""
+    run_on, on_project = ProjectRows.run_on, ProjectRows.on_project
+    select, keys = staticmethod(TextualScreens.select), staticmethod(TextualScreens.keys)
+    SIZE, DESCRIPTION, loaded = (120, 60), TwoPanes.DESCRIPTION, staticmethod(SectionsOnScreen.loaded)
+    read_project = staticmethod(SectionsOnScreen.read_project)
+    ORDER = ["Next", "Current state", "Sessions", "Handoffs", "Notes", "Details", "This month"]
+
+    def setUp(self):
+        SectionsOnScreen.setUp(self)
+        fleet, drill = self.root / "fleet", self.root / "drill"
+        readme = fleet / "README.md"
+        readme.write_text(readme.read_text() + "\n## Current state\n\n" + PANEL_STATE + "\n\n## Next\n\n"
+                          + "\n".join(PANEL_NEXT) + "\n")
+        (drill / "README.md").write_text((drill / "README.md").read_text() + f"\n## Next\n\n{DRILL_NEXT}\n")
+        for p in self.projects:
+            if p["id"] in ("fleet", "drill"):
+                p.update(self.read_project(self.root / p["id"], self.sessions))
+
+    def view(self, seen, label):
+        async def step(pilot):
+            pilot.app.redraw()
+            await pilot.pause()
+            app, W = pilot.app, roost.SIDEBAR_W
+            lines = screen_text(app)
+            seen[label] = {"lines": lines, "boxes": boxes(lines, W), "app_runs": {y: runs(app, y) for y in range(len(lines))},
+                           "bold": bold_text(app), "dim": dim_text(app), "focus": app.ui.focus, "menu": app.ui.choosing,
+                           "bar": " ".join(k for k, _ in (app.ui.bar[0] if app.ui.bar else [])),
+                           "fills": {y: backgrounds(app, y, W) for y in range(len(lines))}}
+        return step
+
+    @staticmethod
+    def color(got, y, x):
+        for x0, text, st in got["app_runs"][y]:
+            if x0 <= x < x0 + len(text):
+                return color_of(st)
+        return None
+
+    def box(self, got, title):
+        found = [b for b in got["boxes"] if b["title"] == title]
+        self.assertEqual(len(found), 1, (title, [b["title"] for b in got["boxes"]]))
+        return found[0]
+
+    def edge_colors(self, got, b):
+        pts = [(b["top"], b["left"]), (b["top"], b["right"]), (b["bottom"], b["left"]), (b["bottom"], b["right"]),
+               (b["top"] + 1, b["left"]), (b["top"] + 1, b["right"])]
+        return {self.color(got, y, x) for y, x in pts}
+
+    def fleet(self, *steps, size=None):
+        seen = {}
+        self.run_on(self.projects, [self.on_project("fleet"), self.loaded, self.view(seen, "start")] + list(steps),
+                    size=size or self.SIZE)
+        return seen
+
+    # 1. The outlines
+
+    def test_each_section_is_a_rounded_outline_titled_in_its_top_edge_in_order(self):
+        got = self.fleet()["start"]
+        titles = [b["title"] for b in got["boxes"]]
+        self.assertEqual(titles, self.ORDER, "\n".join(got["lines"]))
+        for b in got["boxes"]:
+            with self.subTest(section=b["title"]):
+                self.assertIsNotNone(b["bottom"], "╰ under its ╭")
+                line = got["lines"][b["top"]]
+                self.assertTrue(line[b["left"]:].startswith("╭─ "), line)
+                self.assertEqual(got["lines"][b["bottom"]][b["right"]], "╯")
+                for y in range(b["top"] + 1, b["bottom"]):
+                    self.assertEqual((got["lines"][y][b["left"]], got["lines"][y][b["right"]]), ("│", "│"), got["lines"][y])
+                x = line.index(b["title"], b["left"])
+                self.assertTrue([t for yy, xx, t in got["bold"] if yy == b["top"] and xx == x and t.startswith(b["title"])],
+                                f"the title is bold: {line!r}")
+        sessions = self.box(got, "Sessions")
+        self.assertEqual(sessions["count"], "1")
+        cx = got["lines"][sessions["top"]].index(" 1 ", sessions["left"]) + 1
+        self.assertTrue([t for yy, xx, t in got["dim"] if yy == sessions["top"] and xx == cx], "the count is dim")
+
+    def test_the_outlines_are_in_the_line_color(self):
+        got = self.fleet()["start"]
+        self.assertEqual([b["title"] for b in got["boxes"]], self.ORDER, "the fixture: every section's outline")
+        for b in got["boxes"]:
+            with self.subTest(section=b["title"]):
+                self.assertEqual(self.edge_colors(got, b), {LINE_COLOR})
+
+    def test_the_outlines_are_as_wide_as_the_details_and_the_content_two_columns_in(self):
+        for size in ((100, 60), (120, 60), (180, 60)):
+            got = self.fleet(size=size)["start"]
+            full = [b for b in got["boxes"] if b["title"] not in ("Next", "Current state")]
+            with self.subTest(size=size):
+                self.assertEqual(len({(b["left"], b["right"]) for b in full}), 1, full)
+                self.assertEqual(full[0]["right"], size[0] - 2, "the ╮ one blank column short of the window's right edge")
+                for title in ("Sessions", "Details", "This month"):
+                    b = self.box(got, title)
+                    starts = [b["left"] + 1 + len(r) - len(r.lstrip()) for r in inside(got["lines"], b) if r.strip()]
+                    self.assertEqual(min(starts), b["left"] + 2, ("two columns in from the left edge", title, inside(got["lines"], b)))
+
+    def test_stats_is_titled_this_month_with_todays_two_lines_inside(self):
+        got = self.fleet()["start"]
+        rows = [r.strip() for r in inside(got["lines"], self.box(got, "This month")) if r.strip()]
+        self.assertEqual(len(rows), 2, rows)
+        self.assertRegex(rows[0], r"^This month\s+\$1\.25 · 1 Sessions?$")
+        self.assertRegex(rows[1], r"^Last 30 days\s+\$1\.25$")
+        self.assertNotIn("Stats", [b["title"] for b in got["boxes"]])
+
+    # 2. Next and Current state
+
+    def test_next_and_current_state_sit_side_by_side_at_the_same_height(self):
+        got = self.fleet()["start"]
+        nxt, state, sessions = self.box(got, "Next"), self.box(got, "Current state"), self.box(got, "Sessions")
+        self.assertEqual((nxt["top"], nxt["bottom"]), (state["top"], state["bottom"]), "the same rows")
+        self.assertLess(nxt["right"], state["left"], "Next on the left, Current state on the right")
+        wn, ws = nxt["right"] - nxt["left"] + 1, state["right"] - state["left"] + 1
+        self.assertLessEqual(abs(wn - ws), 2, (wn, ws))
+        self.assertGreaterEqual(nxt["left"], sessions["left"])
+        self.assertLessEqual(state["right"], sessions["right"], "together as wide as the other outlines")
+
+    def test_next_and_current_state_split_the_full_width_between_them_at_any_width(self):
+        for size in ((100, 60), (120, 60), (180, 60)):
+            got = self.fleet(size=size)["start"]
+            nxt, state, sessions = self.box(got, "Next"), self.box(got, "Current state"), self.box(got, "Sessions")
+            wn, ws = nxt["right"] - nxt["left"] + 1, state["right"] - state["left"] + 1
+            with self.subTest(size=size):
+                self.assertEqual(sessions["right"], size[0] - 2, "the fixture: the full width runs to the window's right")
+                self.assertEqual((nxt["left"], state["right"]), (sessions["left"], sessions["right"]), "together the full width")
+                self.assertEqual(state["left"] - nxt["right"], 2, "one blank column between them")
+                self.assertLessEqual(abs(wn - ws), 1, ("each about half", wn, ws))
+
+    def test_an_expanded_panel_spans_the_full_width_at_180_columns(self):
+        open_ = {}
+        self.run_on(self.projects, [self.on_project("fleet"), self.loaded, self.keys("right", "down"), self.keys("enter"),
+                                    self.view(open_, "open")], size=(180, 60))
+        got = open_["open"]
+        self.assertTrue([l for l in got["lines"] if "enter to collapse" in l], "the fixture: Current state expanded")
+        state, nxt = self.box(got, "Current state"), self.box(got, "Next")
+        self.assertEqual((state["left"], state["right"]), (roost.SIDEBAR_W + 3, 178), "expanded: the full width")
+        self.assertEqual((nxt["left"], nxt["right"]), (roost.SIDEBAR_W + 3, 178), "the other, below it: the full width")
+
+    def test_a_short_text_shows_whole_and_a_long_one_two_lines_then_enter_to_expand(self):
+        got = self.fleet()["start"]
+        nxt = [r.strip() for r in inside(got["lines"], self.box(got, "Next"))]
+        self.assertEqual([r for r in nxt if r], PANEL_NEXT, "three lines: all of it, no expand")
+        state_box = self.box(got, "Current state")
+        state = [r.strip() for r in inside(got["lines"], state_box) if r.strip()]
+        self.assertEqual(len(state), 3, state)
+        self.assertIn(words(" ".join(state[:2])), words(PANEL_STATE), "its first two lines")
+        self.assertEqual(state[2], "… enter to expand")
+        y = next(y for y in range(state_box["top"] + 1, state_box["bottom"]) if "enter to expand" in got["lines"][y])
+        self.assertTrue([t for yy, xx, t in got["dim"] if yy == y and "enter to expand" in t], "dim")
+        self.assertFalse([r for r in nxt if "expand" in r])
+
+    def test_one_alone_takes_the_full_width(self):
+        seen = {}
+        self.run_on(self.projects, [self.on_project("drill"), self.loaded, self.view(seen, "x")], size=self.SIZE)
+        got = seen["x"]
+        nxt, sessions = self.box(got, "Next"), self.box(got, "Sessions")
+        self.assertEqual((nxt["left"], nxt["right"]), (sessions["left"], sessions["right"]))
+        self.assertIn(DRILL_NEXT, " ".join(r.strip() for r in inside(got["lines"], nxt)))
+        self.assertNotIn("Current state", [b["title"] for b in got["boxes"]])
+
+    # 3 to 5. Selecting and expanding
+
+    def test_next_then_current_state_are_the_first_items_selected_by_a_green_outline_with_no_bar(self):
+        seen = {}
+        self.run_on(self.projects, [self.on_project("fleet"), self.loaded, self.keys("right"), self.view(seen, "next"),
+                                    self.keys("down"), self.view(seen, "state"), self.keys("down"), self.view(seen, "item")],
+                    size=self.SIZE)
+        green, W = roost.GREEN.lower(), roost.SIDEBAR_W
+        for label, title, other in (("next", "Next", "Current state"), ("state", "Current state", "Next")):
+            got = seen[label]
+            with self.subTest(selected=title):
+                b = self.box(got, title)
+                self.assertEqual(self.edge_colors(got, b), {green}, "its outline is green")
+                x = got["lines"][b["top"]].index(title, b["left"])
+                self.assertEqual(self.color(got, b["top"], x), green, "its title is green")
+                self.assertEqual(self.edge_colors(got, self.box(got, other)), {LINE_COLOR})
+                self.assertFalse([l for l in got["lines"] if "▌" in l[W:]], "no ▌ bar")
+        item = seen["item"]
+        self.assertEqual({self.edge_colors(item, self.box(item, t)) == {LINE_COLOR} for t in ("Next", "Current state")}, {True})
+        self.assertEqual(len(pane_selected_rows(item)), 1, "↓ goes on to the first Session")
+
+    def test_enter_expands_a_selected_panel_and_enter_again_collapses_it(self):
+        seen = {}
+        self.run_on(self.projects, [self.on_project("fleet"), self.loaded, self.keys("right", "down"), self.view(seen, "picked"),
+                                    self.keys("enter"), self.view(seen, "open"), self.keys("enter"), self.view(seen, "shut")],
+                    size=self.SIZE)
+        got = seen["open"]
+        self.assertIsNone(got["menu"], "enter expands, it opens no actions")
+        state, nxt, sessions = self.box(got, "Current state"), self.box(got, "Next"), self.box(got, "Sessions")
+        self.assertEqual((state["left"], state["right"]), (sessions["left"], sessions["right"]), "the full width")
+        rows = [r.rstrip() for r in inside(got["lines"], state)]
+        text = words(" ".join(r for r in rows)).replace(" enter to collapse", "")
+        self.assertEqual(text, words(PANEL_STATE), "all its text")
+        last = max(i for i, r in enumerate(rows) if r.strip())
+        self.assertTrue(rows[last].endswith("enter to collapse"), rows)
+        self.assertGreaterEqual(len(rows[last]), state["right"] - state["left"] - 1 - 2, "right-aligned in the outline")
+        y = state["top"] + 1 + last
+        self.assertTrue([t for yy, xx, t in got["dim"] if yy == y and "enter to collapse" in t], "dim")
+        self.assertGreater(nxt["top"], state["bottom"], "Next below it")
+        self.assertEqual((nxt["left"], nxt["right"]), (sessions["left"], sessions["right"]), "at the full width")
+        self.assertEqual([r.strip() for r in inside(got["lines"], nxt) if r.strip()], PANEL_NEXT, "still collapsed")
+        shut = seen["shut"]
+        a, b = self.box(shut, "Next"), self.box(shut, "Current state")
+        self.assertEqual(a["top"], b["top"], "collapsed: side by side again")
+        self.assertIn("… enter to expand", [r.strip() for r in inside(shut["lines"], b)])
+        self.assertFalse([l for l in shut["lines"] if "enter to collapse" in l])
+
+    def test_enter_on_another_item_still_opens_its_actions(self):
+        seen = {}
+        self.run_on(self.projects, [self.on_project("fleet"), self.loaded, self.keys("right", "down", "down", "enter"),
+                                    self.view(seen, "x")], size=self.SIZE)
+        self.assertIsNotNone(seen["x"]["menu"])
+        self.assertEqual(seen["x"]["menu"]["title"], "Printer fix")
+
+    def test_the_key_bar_says_enter_expand_or_collapse_on_a_panel_and_enter_actions_elsewhere(self):
+        seen = {}
+        self.run_on(self.projects, [self.on_project("fleet"), self.loaded, self.keys("right"), self.view(seen, "next"),
+                                    self.keys("enter"), self.view(seen, "open"), self.keys("enter", "down", "down"),
+                                    self.view(seen, "item")], size=self.SIZE)
+        self.assertIn("enter expand", seen["next"]["bar"])
+        self.assertNotIn("enter actions", seen["next"]["bar"])
+        self.assertIn("enter collapse", seen["open"]["bar"])
+        self.assertIn("enter actions", seen["item"]["bar"])
+
+    def test_another_project_shows_with_nothing_expanded(self):
+        seen = {}
+        self.run_on(self.projects, [self.on_project("fleet"), self.loaded, self.keys("right", "down", "enter"), self.view(seen, "open"),
+                                    self.keys("left", "down"), self.view(seen, "other"), self.keys("up"), self.view(seen, "back")],
+                    size=self.SIZE)
+        self.assertTrue([l for l in seen["open"]["lines"] if "enter to collapse" in l], "the fixture: it expanded")
+        for when in ("other", "back"):
+            with self.subTest(when=when):
+                self.assertFalse([l for l in seen[when]["lines"] if "enter to collapse" in l])
+        back = seen["back"]
+        self.assertEqual(self.box(back, "Next")["top"], self.box(back, "Current state")["top"], "side by side, collapsed")
+
+    def test_an_expanded_panels_text_scrolls_with_the_details(self):
+        seen, wheel = {}, DetailScroll.wheel
+        steps = [self.on_project("fleet"), self.loaded, self.keys("right", "down", "enter"), self.view(seen, 0)]
+        for i in range(1, 30):
+            steps += [wheel(roost.ProjectPanel), self.view(seen, i)]
+        self.run_on(self.projects, steps, size=(100, 28))
+        tops = [next((y for y, l in enumerate(seen[i]["lines"]) if "Current state" in l[roost.SIDEBAR_W:]), None) for i in range(30)]
+        self.assertIsNotNone(tops[0], "the fixture: the expanded panel shows at first")
+        self.assertIsNone(tops[-1], "scrolled past it")
+        self.assertTrue([i for i in range(30) if STATE_END in " ".join(seen[i]["lines"])], "its last words show on the way")
+
+    # 8. No fills
+
+    def test_no_background_fill_in_the_details(self):
+        seen = {}
+        self.run_on(self.projects, [self.on_project("fleet"), self.loaded, self.view(seen, "list"), self.keys("right"),
+                                    self.view(seen, "next"), self.keys("down", "enter"), self.view(seen, "open")], size=self.SIZE)
+        for label, got in seen.items():
+            with self.subTest(when=label):
+                self.assertEqual({y: f for y, f in got["fills"].items() if f}, {})
+
+
+def pane_selected_rows(got):
+    """The rows right of the sidebar with a ▌ (an item's selection mark)."""
+    return [y for y, l in enumerate(got["lines"]) if "▌" in l[roost.SIDEBAR_W:]]
+
+
+@unittest.skipUnless(roost.App, "Textual isn't installed here: run the tests with ~/.roost/venv/bin/python")
+class ScrolledPanels(unittest.TestCase):
+    """The details scrolled in a short window (100x28): while there's more below, "↓ more" takes their last row
+    on its own and covers nothing; with the end showing, no marker and the last row is content. A click inside
+    Next's or Current state's outline selects that panel wherever the scroll has put it, and a double-click
+    expands it."""
+    run_on, on_project = ProjectRows.run_on, ProjectRows.on_project
+    select, keys = staticmethod(TextualScreens.select), staticmethod(TextualScreens.keys)
+    loaded, wheel = staticmethod(SectionsOnScreen.loaded), staticmethod(DetailScroll.wheel)
+    SHORT = (100, 28)
+
+    def setUp(self):
+        DetailPanels.setUp(self)
+
+    DESCRIPTION, read_project = DetailPanels.DESCRIPTION, staticmethod(SectionsOnScreen.read_project)
+
+    def view(self, seen, label):
+        async def step(pilot):
+            pilot.app.redraw()
+            await pilot.pause()
+            app, ui = pilot.app, pilot.app.ui
+            box, lines = app.query_one(roost.ProjectPanel).region, screen_text(app)
+            seen[label] = {"lines": lines, "pane": [l[roost.SIDEBAR_W:] for l in lines[box.y:box.bottom]], "y0": box.y,
+                           "focus": ui.focus, "dsel": getattr(ui, "dsel", None), "menu": ui.choosing}
+        return step
+
+    def full(self):
+        """The details whole, at 100x80: their rows, trailing blanks left out."""
+        seen = {}
+        self.run_on(self.projects, [self.on_project("fleet"), self.loaded, self.view(seen, "x")], size=(100, 80))
+        rows = [DetailScroll.norm(l) for l in seen["x"]["pane"]]
+        while rows and not rows[-1]:
+            rows.pop()
+        return rows
+
+    @staticmethod
+    def bare(row):
+        return row.strip(" │▕▏")
+
+    def test_more_below_takes_the_last_row_alone_and_the_rows_above_are_the_details_unchanged(self):
+        full = self.full()
+        seen = {}
+        steps = [self.on_project("fleet"), self.loaded, self.view(seen, 0)]
+        for i in range(1, 12):
+            steps += [self.wheel(roost.ProjectPanel), self.view(seen, i)]
+        self.run_on(self.projects, steps, size=self.SHORT)
+        room = len(seen[0]["pane"])
+        self.assertGreater(len(full), room, "the fixture: the details don't fit at 100x28")
+        ends = 0
+        for i in range(12):
+            got = seen[i]
+            rows = [DetailScroll.norm(l) for l in got["pane"]]
+            with self.subTest(turn=i):
+                if any("↓ more" in r for r in rows):
+                    self.assertEqual(self.bare(rows[-1]), "↓ more", f"the marker's row has nothing else: {rows[-1]!r}")
+                    self.assertFalse([r for r in rows[:-1] if "↓ more" in r], "only on the last row")
+                    above = rows[:-1]
+                    at = [o for o in range(len(full)) if full[o:o + len(above)] == above]
+                    self.assertEqual(len(at), 1, ("the rows above are the details as drawn whole, nothing cut", above))
+                else:
+                    ends += 1
+                    self.assertEqual(rows[-1], full[-1], "the end: the last row is the details' last line")
+        self.assertTrue(ends, "the fixture: the wheel reached the end")
+        self.assertIn("↓ more", " ".join(seen[0]["pane"]), "the fixture: more below at first")
+
+    def click_on(self, seen, label, text, times=1, right_half=False):
+        """A step: click (times) on the screen row and column where text is drawn in the details (in the right
+        half of the details when right_half), and remember that row under label."""
+        async def step(pilot):
+            pilot.app.redraw()
+            await pilot.pause()
+            lines, W = screen_text(pilot.app), roost.SIDEBAR_W
+            mid = W + (len(lines[0]) - W) // 2  # the details' right half: Current state's side
+            hits = [(y, l.index(text, mid if right_half else W)) for y, l in enumerate(lines)
+                    if text in l[(mid if right_half else W):]]
+            assert hits, f"{text!r} isn't on screen: {lines}"
+            y, x = hits[0]
+            seen[label] = y
+            await pilot.click(offset=(x + 1, y), times=times)
+            await pilot.pause()
+        return step
+
+    def test_a_click_in_a_scrolled_outline_selects_that_panel_and_a_double_click_expands_it(self):
+        first = {}
+        self.run_on(self.projects, [self.on_project("fleet"), self.loaded, self.view(first, "x")], size=self.SHORT)
+        top = min(b["top"] for b in boxes(first["x"]["lines"], roost.SIDEBAR_W) if b["title"] in ("Next", "Current state"))
+        # each scroll leaves the panels partly on screen, the clicked row above where their outlines were unscrolled
+        cases = {"wheel": ([self.wheel(roost.ProjectPanel)], PANEL_NEXT[0], "Drivers are packaged"),
+                 "page down": ([self.keys("right", "pagedown"), self.wheel(roost.ProjectPanel, 4, down=False)],
+                               PANEL_NEXT[2], "… enter to expand")}
+        for case, (scroll, next_text, state_text) in cases.items():
+            for panel, text, right, dsel in (("Next", next_text, False, 0), ("Current state", state_text, True, 1)):
+                seen, rows = {}, {}
+                self.run_on(self.projects, [self.on_project("fleet"), self.loaded] + scroll
+                            + [self.click_on(rows, "click", text, right_half=right), self.view(seen, "clicked")], size=self.SHORT)
+                self.run_on(self.projects, [self.on_project("fleet"), self.loaded] + scroll
+                            + [self.click_on(rows, "double", text, times=2, right_half=right), self.view(seen, "double")],
+                            size=self.SHORT)
+                with self.subTest(scroll=case, panel=panel):
+                    self.assertLess(rows["click"], top, "the fixture: the click is where no outline was before the scroll")
+                    got = seen["clicked"]
+                    self.assertEqual((got["focus"], got["dsel"], got["menu"]), ("pane", dsel, None), "the click selects that panel")
+                    self.assertTrue([l for l in seen["double"]["lines"] if "enter to collapse" in l], "the double-click expands it")

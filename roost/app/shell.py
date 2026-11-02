@@ -93,7 +93,7 @@ class Shell:
         names = [tab.name for tab in self.TABS]
         self.tab = names.index("Sessions") if query else start_tab(names)  # a search is for Sessions
         self.focus = "side"
-        self.psel, self.ptop, self.prow_y, self.tab_x = 0, 0, {}, []
+        self.psel, self.ptop, self.prow_y, self.tab_x, self.dopen = 0, 0, {}, [], None
         self.pquery = ""  # the Projects tab's search
         self.folded = {"Inactive", "Closed"}  # closed sections
         self.nsel, self.ntop, self.nrow_y, self.nquery = 0, 0, {}, ""  # Notes: selection, scroll, rows, search
@@ -125,6 +125,11 @@ class Shell:
     @classmethod
     def label(cls, state):
         return cls.LABELS.get(state, state)
+
+    def strip(self):
+        """The current tab's summary strip, as (mark, attr, number, word) parts, or [] when it has none."""
+        fn = getattr(self, f"{self.TABS[self.tab].name.lower()}_strip", None)
+        return fn() if fn else []
 
     def picked(self, attr):
         """attr as the selected row's name shows it in a list: bold green, with no band behind it."""

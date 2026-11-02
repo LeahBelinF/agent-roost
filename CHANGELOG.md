@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026.11.02
+
+- **Sessions rows:** the views are words over the table, the current one underlined, each with its count. The table sits in an outline with the view in its top edge. Each Session takes two lines, its row and then its status mark and last message; STATUS is no longer a column, and the panel no longer repeats the last message
+- **Live Sessions only:** a project's details list its running Sessions; a closed one a Handoff covers no longer shows (the Sessions tab's Closed view still has it). One closed in the last 7 days with no Handoff shows as closed, no Handoff, and its actions lead with writing its Handoff, then Resume this Session with its context's size and what re-reading it costs (2× on the 1-hour cache, 1.25× on the 5-minute one)
+- **Full-width details:** a project's details fill the window beside the list instead of stopping at 80 columns; Next and Current state split the width
+- **Outlined details:** each section of a project's details is a rounded outline with its title and count in the top edge. Next and Current state sit side by side, each showing its first lines and `… enter to expand`; with the keys in the details they're the first items, and enter expands one to the full width with all its text, its outline green, and folds it back again. Stats is now This month
+- **Lighter lines:** rules, outlines, and the list's divider are drawn a step lighter, so they show on a dark background
+- **Fixes:** roost no longer warns that Claude Code "changed its session list (missing id, state)" when no background Session is running; it checks each entry for what it needs, and a background entry for its job id. A long description in a project's Details wraps to the room its outline has, so no line loses its end to "…"
+- **Summary strip:** centered under the tabs: on Projects, how many Sessions run, how many projects are ready to pick up, and what was spent today and this month; on Sessions, how many run, closed today, and are unfiled
+- **Project rows:** each project in the list takes two lines, its name and then its status, how many Sessions run in it, and when it was last worked
+- **Tasks:** a project's or sub-project's tasks are Markdown files in its `tasks/` folder, each with a status (todo, in-progress, in-review, done, blocked), the Session that claimed it, and dated notes. `roost task new`, `list`, `show`, `claim`, `note`, and `status` make and move them
+
 ## 2026.10.29
 
 - **Tabs:** Projects, Sessions, Notes, and Stats, the current one in green; Tab and Shift+Tab move between them, a click on a name switches, and roost opens on the tab you last used. Sessions, Notes, and Stats take the whole window; a thin rule, with a blank row each side, sits under the tabs

@@ -54,8 +54,9 @@ class TextualScreens(unittest.TestCase):
             pilot.app.ui.summaries = {done["id"]: {"state": "running", "text": "writing", "name": done["name"],
                                                    "step": 1, "steps": 3, "started": time.time()}}
             await open_view("Sessions")(pilot)
-        lines = self.screen(self.run_app([start]))  # the whole width: the Sessions tab has no sidebar
-        heads = [l.strip().split(" (")[0] for l in lines if "(1)" in l]
+        # the whole width: the Sessions tab has no sidebar; 40 rows: at 30 a Session's two lines leave no room for the second section
+        lines = self.screen(self.run_app([start], size=(120, 40)))
+        heads = [l.strip(" │").split(" (")[0] for l in lines if "(1)" in l]  # inside the table's outline
         self.assertEqual(heads[-1], "Wrapping up")
         self.assertLess(next(i for i, l in enumerate(lines) if "Laptop refresh" in l),
                         next(i for i, l in enumerate(lines) if "Printer fix" in l))
@@ -512,6 +513,13 @@ class TextualScreens(unittest.TestCase):
         return step
 
     @staticmethod
+    def panel_line(app, text):
+        """The Sessions panel's line holding text, as drawn now: the selected Session's name and status
+        (STATUS is no column). "" when no line of the panel holds it."""
+        box = app.query_one(roost.SessionPanel).region
+        return next((l for l in screen_text(app)[box.y:box.y + box.height] if text in l), "")
+
+    @staticmethod
     def line_of(lines, text):
         """The first list line holding text (the panel at the bottom comes after the list)."""
         return next((l for l in lines[:-10] if text in l), None)
@@ -546,15 +554,15 @@ class TextualScreens(unittest.TestCase):
         p, _, _ = self.fleet()
         seen = {}
         names = lambda app: [s["name"] for s in app.ui.srows]
-        status = lambda app: self.line_of(screen_text(app), "Toner order")
+        status = lambda app: self.panel_line(app, "Toner order")  # Toner order is selected
         self.run_with("Sessions", [p], [
             open_view("Sessions"), self.keys(*self.CLOSED_VIEW), self.look(seen, "before", names),
             self.on_session("Toner order"), self.pick("Dismiss"),
-            self.look(seen, "closed view", names), self.look(seen, "status", status),
+            self.look(seen, "closed view", names), self.on_session("Toner order"), self.look(seen, "status", status),
             self.select(lambda ui: setattr(ui, "sort", ("NAME", True))), self.look(seen, "by name", names),  # Z to A: Toner order would lead Closed
             self.select(lambda ui: setattr(ui, "sort", ("LAST ACTIVE", True))),
             self.on_session("Toner order"), self.pick("Undismiss"),
-            self.look(seen, "after", names), self.look(seen, "status after", status)],
+            self.look(seen, "after", names), self.on_session("Toner order"), self.look(seen, "status after", status)],
             size=(120, 40))  # the status line takes a row: at 30 rows the Dismissed section's row is cut off
         self.assertLess(seen["before"].index("Toner order"), seen["before"].index("Old printer audit"))  # the fixture
         for view in ("closed view", "by name"):
@@ -571,16 +579,21 @@ class TextualScreens(unittest.TestCase):
         self.run_with("Sessions", [p], [open_view("Sessions"), self.keys(*self.CLOSED_VIEW), self.on_session("Toner order"), self.pick("Dismiss")])
         self.assertIn(self.sessions[2]["id"], self.persisted())
         self.sessions = pristine
-        app = self.run_with("Sessions", [p], [open_view("Sessions"), self.keys(*self.CLOSED_VIEW)])
-        self.assertIn("dismissed", self.line_of(self.screen(app), "Toner order"))
+        seen = {}
+        app = self.run_with("Sessions", [p], [open_view("Sessions"), self.keys(*self.CLOSED_VIEW), self.on_session("Toner order"),
+                                              self.look(seen, "status", lambda app: self.panel_line(app, "Toner order"))])
+        self.assertIn("dismissed", seen["status"])
         self.assertEqual(app.ui.srows[-1]["name"], "Toner order")
 
     def test_the_sessions_tab_still_lists_a_wrapped_up_session(self):
-        app, _ = self.with_wrapped("Sessions", ["wrapped"], [open_view("Sessions"), self.keys(*self.CLOSED_VIEW)])  # it's closed
+        seen = {}
+        app, _ = self.with_wrapped("Sessions", ["wrapped"], [open_view("Sessions"), self.keys(*self.CLOSED_VIEW),  # it's closed
+                                                             self.on_session("Old printer audit"),
+                                                             self.look(seen, "status", lambda app: self.panel_line(app, "Old printer audit"))])
         self.assertEqual(app.ui.TABS[app.ui.tab].name, "Sessions")
         line = next((l for l in self.screen(app)[:-10] if "Old printer audit" in l), None)
         self.assertIsNotNone(line, "\n".join(self.screen(app)))
-        self.assertIn("✓ wrapped up", line)
+        self.assertIn("✓ wrapped up", seen["status"])  # in the panel: STATUS is no column
 
     # The Sessions views: Running and Closed, a simple history, and Unfiled.
 
@@ -601,8 +614,70 @@ class TextualScreens(unittest.TestCase):
         self.run_app([open_view("Sessions"), self.look(seen, "row", self.view_row),
                       self.keys("slash", *"printer", "enter"), self.look(seen, "searched", self.view_row)])
         # no project lists any of the five Sessions, and there are no notes: all five are unfiled
-        self.assertRegex(seen["row"], r"^\s*Running \(2\)\s+Closed \(3\)\s+Unfiled \(5\)\s*$")
-        self.assertRegex(seen["searched"], r"^\s*Running \(1\)\s+Closed \(2\)\s+Unfiled \(\d+\)\s+/ printer\s*$")
+        self.assertRegex(seen["row"], r"^\s*Running 2 {4}Closed 3 {4}Unfiled 5\s*$")
+        self.assertRegex(seen["searched"], r"^\s*Running 1 {4}Closed 2 {4}Unfiled \d+\s+/ printer\s*$")
+
+    def test_the_sessions_strip_reads_running_closed_today_and_unfiled_with_numbers_bold_and_words_dim(self):
+        """On row 4, with a blank row under it: ● N running (the status bar's count), N closed today (closed
+        Sessions whose last activity was today), N unfiled (the Unfiled view's count); a count of 0 still shows."""
+        W = importlib.import_module("roost.app.widgets")
+        green, muted = W.GREEN.lower(), W.MUTED.lower()
+        parts = re.compile(r"●\s*(\d+)\s+running\b.*?(\d+)\s+closed today\b.*?(\d+)\s+unfiled\b")
+
+        def strip(app):
+            lines = screen_text(app)
+            unfiled = re.search(r"\bUnfiled (\d+)\b", lines[app.ui.view_row_y])
+            return {"text": lines[4], "runs": runs(app, 4), "fills": backgrounds(app, 4), "lines": lines,
+                    "running": app.ui.status_line()[1], "unfiled": unfiled and unfiled.group(1)}
+        from datetime import date
+        today = date.today()
+        cases = {"none closed": list(self.sessions)}
+        self.views_fixture()
+        cases["views"] = list(self.sessions)
+        for case, sessions in cases.items():
+            self.sessions, seen = sessions, {}
+            self.run_app([open_view("Sessions"), self.look(seen, "x", strip)])
+            got = seen["x"]
+            want_closed = sum(s["state"] == "closed" and datetime.fromtimestamp(s["last"]).date() == today for s in sessions)
+            with self.subTest(case=case):
+                m = parts.search(got["text"])
+                self.assertIsNotNone(m, "\n".join(got["lines"][:8]))
+                running = re.match(r"(\d+) running", got["running"])
+                self.assertEqual(m.group(1), running.group(1) if running else "0")
+                self.assertEqual(int(m.group(2)), want_closed)
+                self.assertEqual(m.group(3), got["unfiled"], "the Unfiled view's count")
+                self.assertEqual(got["fills"], set(), "no background on the strip")
+                styles = [st for x0, text, st in got["runs"] for _ in text]
+                text = got["text"]
+                self.assertEqual(color_of(styles[text.index("●")]), green)
+                for word in ("running", "closed today", "unfiled"):
+                    x = text.index(word)
+                    self.assertEqual({color_of(st) for st in styles[x:x + len(word)]}, {muted}, f"{word} is dim")
+                for g in (1, 2, 3):
+                    self.assertTrue(all(st and st.bold for st in styles[m.start(g):m.end(g)]), f"{m.group(g)} is bold")
+                self.assertRegex(got["lines"][5].strip(), r"^$", "a blank row under the strip")
+        self.assertEqual(sum(s["state"] == "closed" for s in cases["none closed"]), 0, "the fixture: a case with 0 closed today")
+
+    def test_the_sessions_strip_is_centered_across_the_whole_width(self):
+        """The blank columns before the strip and after it differ by at most 1, whatever its counts and the
+        screen's width; its parts in order, five blank columns between them."""
+        order = re.compile(r"^● \d+ running {5}\d+ closed today {5}\d+ unfiled$")
+
+        def strip(app):
+            return {"text": screen_text(app)[4], "gaps": row_gaps(app, 4), "width": app.size.width}
+        cases = {"none closed": list(self.sessions)}
+        self.views_fixture()
+        cases["views"] = list(self.sessions)
+        for case, sessions in cases.items():
+            for size in ((120, 30), (151, 30)):
+                self.sessions, seen = sessions, {}
+                self.run_app([open_view("Sessions"), self.look(seen, "x", strip)], size=size)
+                got = seen["x"]
+                with self.subTest(case=case, width=size[0]):
+                    self.assertRegex(got["text"].strip(), order, "the parts in order, five blank columns between them")
+                    before, after = got["gaps"]
+                    self.assertLessEqual(abs(before - after), 1, f"{before} blank columns before the strip and {after} "
+                                                                 f"after it, {got['width']} wide: {got['text']!r}")
 
     def test_the_current_view_is_bold_green_with_no_background_and_the_others_dim(self):
         self.views_fixture()
@@ -612,7 +687,9 @@ class TextualScreens(unittest.TestCase):
             y, line = app.ui.view_row_y, screen_text(app)[app.ui.view_row_y]
             out = {}
             for label in roost.VIEWS:
-                x = line.index(f"{label} (")
+                m = re.search(rf"\b{label} \d+", line)
+                assert m, f"{label} and its count aren't in the view row {line!r}"
+                x = m.start()
                 out[label] = [style_at(app, y, i) for i in range(x, x + len(label))]
             return roost.VIEWS[app.ui.view], out, backgrounds(app, y), line
         steps = [open_view("Sessions")]
@@ -641,8 +718,9 @@ class TextualScreens(unittest.TestCase):
             out = {}
             for n, y in ys.items():
                 x = lines[y].index(n)
+                tick = lines[y].rfind("›", 0, x)  # the mark before the name, inside the table's outline
                 out[n] = {"name": [style_at(app, y, x + i) for i in range(len(n))], "fills": backgrounds(app, y),
-                          "mark": (lines[y][1], color_of(style_at(app, y, 1))), "line": lines[y]}
+                          "mark": ("›", color_of(style_at(app, y, tick))) if tick >= 0 else (None, None), "line": lines[y]}
             return sel, out
         self.run_app([open_view("Sessions"), self.look(seen, "x", look)])
         sel, out = seen["x"]
@@ -678,7 +756,9 @@ class TextualScreens(unittest.TestCase):
                 pilot.app.redraw()
                 await pilot.pause()
                 y = pilot.app.ui.view_row_y
-                x = screen_text(pilot.app)[y].index(f" {label} (") + 3
+                m = re.search(rf"\b{label} \d+", screen_text(pilot.app)[y])
+                assert m, f"{label} and its count aren't in the view row {screen_text(pilot.app)[y]!r}"
+                x = m.start() + 2
                 await pilot.click(offset=(x, y))
             return step
         self.run_app([open_view("Sessions"), click("Closed"), self.look(seen, "closed", view),
@@ -1250,8 +1330,9 @@ class TopTabs(unittest.TestCase):
 
     def test_a_blank_row_a_rule_and_a_blank_row_separate_the_top_bar_from_the_content_on_every_tab(self):
         """On every tab row 1 is blank, row 2 is a rule (─) across the whole width in the faint line color, row 3
-        is blank, and the content starts on row 4: on Projects the list's first row and the details' name line,
-        on Sessions the views row, on Notes and Stats their first row."""
+        is blank. On Projects and Sessions row 4 is the summary strip, row 5 blank, and the content starts on
+        row 6: on Projects the list's first row and the details' name line, on Sessions the views row. On Notes
+        and Stats there's no strip and the content starts on row 4."""
         seen, W = {}, roost.SIDEBAR_W
 
         def grab(name):
@@ -1272,17 +1353,51 @@ class TopTabs(unittest.TestCase):
                 self.assertEqual(shown, name)
                 top = "\n".join(lines[:7])
                 self.assertEqual(lines[2], "─" * 120, "a rule across the whole width:\n" + top)
-                self.assertEqual(set(rule), {roost.LINE.lower()}, "the rule is in the faint line color")
+                self.assertEqual(set(rule), {"#3a4049"}, "the rule is in the line color")
                 self.assertTrue(blank(lines[1]) and blank(lines[3]), "a blank row each side of the rule:\n" + top)
-                first = next((y for y in range(3, len(lines)) if not blank(lines[y])), None)
-                self.assertEqual(first, 4, "then the content:\n" + top)
+                strip = name in ("Projects", "Sessions")
+                if strip:
+                    self.assertRegex(lines[4], r"●\s*\d+\s+running\b", "the summary strip on row 4:\n" + top)
+                    self.assertTrue(blank(lines[5]), "a blank row under the strip:\n" + top)
+                else:
+                    self.assertFalse([l for l in lines[1:6] if re.search(r"\d+\s+running\b", l)], "no strip:\n" + top)
+                start = 6 if strip else 4
+                first = next((y for y in range(5 if strip else 3, len(lines)) if not blank(lines[y])), None)
+                self.assertEqual(first, start, "then the content:\n" + top)
                 if name == "Projects":
-                    side = next((y for y in range(3, len(lines)) if not blank(lines[y][:W])), None)
-                    self.assertEqual(side, 4, "the list's first row:\n" + top)
-                    nm = min(((y, t) for y, x, t in bold if x >= W and y > 0), default=None)
-                    self.assertEqual(nm and nm[0], 4, ("the details' name line", nm))
+                    side = next((y for y in range(5, len(lines)) if not blank(lines[y][:W])), None)
+                    self.assertEqual(side, 6, "the list's first row:\n" + top)
+                    nm = min(((y, t) for y, x, t in bold if x >= W and y > 5), default=None)
+                    self.assertEqual(nm and nm[0], 6, ("the details' name line", nm))
                 if name == "Sessions":
-                    self.assertRegex(lines[4], r"^\s*Running \(\d+\)\s+Closed \(\d+\)\s+Unfiled \(\d+\)", "the views row")
+                    self.assertRegex(lines[6], r"^\s*Running \d+ {4}Closed \d+ {4}Unfiled \d+", "the views row")
+
+    def test_the_lists_divider_and_the_sessions_and_notes_rules_are_in_the_line_color(self):
+        """#3a4049: the Projects list's divider, the Sessions list's section rules, and the Notes list's."""
+        seen = {}
+
+        def rules(app):
+            lines, out = screen_text(app), set()
+            for y, l in enumerate(lines[3:-3], 3):  # under the tab bar's rule, above the status and key bars
+                for x, ch in enumerate(l):
+                    if ch == "─":
+                        out.add(color_of(style_at(app, y, x)))
+            return out, lines
+
+        def divider(app):
+            lines, W = screen_text(app), roost.SIDEBAR_W
+            ys = [y for y, l in enumerate(lines[6:-3], 6) if len(l) >= W and l[W - 1].strip()]
+            return {color_of(style_at(app, y, W - 1)) for y in ys}, [lines[y][W - 1] for y in ys]
+        self.start([self.look(seen, "divider", divider), open_view("Sessions"), self.look(seen, "sessions", rules),
+                    open_view("Notes"), self.look(seen, "notes", rules)], size=(120, 40))
+        colors, chars = seen["divider"]
+        self.assertTrue(chars, "the fixture: the list's divider is drawn")
+        self.assertEqual(colors, {"#3a4049"}, ("the list's divider", chars))
+        for tab in ("sessions", "notes"):
+            colors, lines = seen[tab]
+            with self.subTest(tab=tab):
+                self.assertTrue(colors, "the fixture: a section rule is drawn\n" + "\n".join(lines[:12]))
+                self.assertEqual(colors, {"#3a4049"})
 
     def test_sessions_notes_and_stats_take_the_whole_window_with_no_project_list(self):
         widget = {"Sessions": [roost.SessionList], "Notes": [roost.NoteList, roost.NoteCard], "Stats": [roost.StatsView]}
@@ -1326,8 +1441,9 @@ class TopTabs(unittest.TestCase):
         self.assertLess(box.x, 4, box)
         self.assertGreater(box.width, 120 - roost.SIDEBAR_W, box)
         head = next(l for l in lines if "NAME" in l)
-        for title in ("NAME", "STATUS", "LAST ACTIVE", "CONTEXT", "PROJECT"):
+        for title in ("NAME", "LAST ACTIVE", "CONTEXT", "PROJECT"):
             self.assertIn(title, head, f"{title} is cut off: {head!r}")
+        self.assertNotIn("STATUS", head)
 
     def test_the_notes_card_is_beside_its_list_at_120_columns(self):
         seen = {}
