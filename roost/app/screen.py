@@ -1,5 +1,5 @@
 """The Textual front end: the screens as widgets, and the keys and the mouse fed back to them."""
-import curses, time, traceback
+import curses, os, time, traceback
 
 from roost.app.shell import QUIT
 from roost.app.ui import UI
@@ -20,6 +20,7 @@ if Widget:
     from textual.css.query import NoMatches
     from textual.screen import Screen
     from textual.containers import Horizontal, Vertical
+    from textual.drivers.linux_driver import LinuxDriver
     from textual.widgets import Input, Label
     from roost.app.widgets import AlertBox, ConfirmBox, HelpBox, KeyBar, Menu, Region, StatusBar, TooSmall, TopBar
     from roost.app.shell import SIDEBAR_W
@@ -178,6 +179,17 @@ if Widget:
             self.app.ui.copy_text(self.get_selected_text(), "Copied the selected text")
             self.app.redraw()
 
+    class HerdrDriver(LinuxDriver):
+        """Textual's driver, asking only for SGR mouse reports (1006). With urxvt's (1015) on too, the Herdr
+        app switches to urxvt's encoding once its tab loses focus and gets it back, and Textual reads only
+        SGR, so every click after the first space switch was dropped (Herdr 0.1.13)."""
+        def _enable_mouse_support(self):
+            if not self._mouse:
+                return
+            for mode in ("1000", "1003", "1006"):
+                self.write(f"\x1b[?{mode}h")
+            self.flush()
+
     class RoostApp(App):
         """roost on Textual. Returns a Session to open in this terminal when there's no other, or None."""
         # the app's CSS, so it wins over the Textual widgets' own
@@ -206,6 +218,9 @@ if Widget:
             super().__init__(ansi_color=True)  # the frame is the terminal's own background, translucency and all
             self.ui = TextualUI(self, sessions, query)
             self.drawn, self.last_key, self.last_refresh = None, time.time(), time.time()
+
+        def get_driver_class(self):
+            return HerdrDriver if os.environ.get("HC_TERMINAL_ID") else super().get_driver_class()
 
         def get_default_screen(self):
             return RoostScreen(id="_default")
