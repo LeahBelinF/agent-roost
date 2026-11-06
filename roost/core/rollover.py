@@ -48,7 +48,10 @@ def check(hook, now=None):
     if rolling(sid, now):
         return {"decision": "block", "reason": f"This Session is already rolling over into a fresh {pid} Session. "
                                                f"Start a prompt with {SKIP} to send it here instead."}
-    s = sessiondata.parse(Path(hook["transcript_path"]))
+    transcript = hook.get("transcript_path")
+    if not transcript or not Path(transcript).is_file():  # a Session's first prompt: nothing written yet
+        return None
+    s = sessiondata.parse(Path(transcript))
     left = sessiondata.cache_left(s, now)
     if left is None or left > 0 or s["tokens"] < cfg.get("rollover_tokens", DEFAULT_TOKENS):
         return None

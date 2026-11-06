@@ -12,6 +12,7 @@ LOG = Path.home() / ".cache" / "roost.log"
 REPO = "dmcphearson/agent-roost"
 UPDATE_CHECK = Path.home() / ".cache" / "roost-update-check.json"
 PROJECTS = Path.home() / ".claude" / "projects"
+CLAUDE_SESSIONS = Path.home() / ".claude" / "sessions"  # <pid>.json: each running claude's Session id
 INDEX = Path.home() / ".cache" / "roost-index-v8.json"  # bump when parse() output changes
 JOBS = Path.home() / ".claude" / "jobs"
 PINS = JOBS / "pins.json"

@@ -8,13 +8,19 @@ from pathlib import Path
 
 from roost.core import config
 from roost.core.handoffs import session_transcripts
+from roost.core.terminals import terminal_session
 
-CLAUDE_SESSIONS = Path.home() / ".claude" / "sessions"  # <pid>.json: each running claude's Session id
 LINKS_CACHE = Path.home() / ".cache" / "roost-links"
 FRESH = 120  # seconds an answer is reused before gh is asked again
 
-CLICKUP_URL = re.compile(r"https://app\.clickup\.com/t/(?:\d+/)?([A-Za-z0-9][\w-]*)")
-CU_ID = re.compile(r"(?<![\w-])[Cc][Uu]-(\d[0-9a-z]{5,11})(?![0-9a-z])")
+# The ticket tracker, in one place so it can become a config setting: `link` finds a ticket's URL in what
+# was said (group 1 is its id), `tag` finds a bare ticket id in branch names and commit messages, and `url`
+# makes a tag's id into a link. ClickUp for now.
+TICKETS = {
+    "link": re.compile(r"https://app\.clickup\.com/t/(?:\d+/)?([A-Za-z0-9][\w-]*)"),
+    "tag": re.compile(r"(?<![\w-])[Cc][Uu]-(\d[0-9a-z]{5,11})(?![0-9a-z])"),
+    "url": "https://app.clickup.com/t/{id}",
+}
 PR_URL = re.compile(r"^https://github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)")
 GITHUB_REMOTE = re.compile(r"github\.com[:/]([\w.-]+/[\w.-]+?)(?:\.git)?/?$")
 DEFAULT_BRANCHES = {"", "HEAD", "main", "master"}
@@ -27,22 +33,6 @@ def run(cmd, cwd=None):
     except (OSError, subprocess.SubprocessError):
         return None
     return r.stdout if r.returncode == 0 else None
-
-
-def terminal_session(address):
-    """The Session id of the claude running in a Herdr terminal, or None. Its process's file in
-    ~/.claude/sessions comes first (it follows /clear); then a --session-id or --resume in its argv."""
-    out = run(["hc", "get", address])
-    try:
-        fg = json.loads(out or "")["foreground"] or {}
-    except (ValueError, KeyError, TypeError):
-        return None
-    try:
-        return json.loads((CLAUDE_SESSIONS / f"{fg['pid']}.json").read_text())["sessionId"]
-    except (KeyError, OSError, ValueError, TypeError):
-        pass
-    argv = fg.get("argv") or []
-    return next((argv[i + 1] for i, a in enumerate(argv[:-1]) if a in ("--session-id", "--resume", "-r")), None)
 
 
 def said(rec):
@@ -79,12 +69,12 @@ def scan(sid):
                 branch, cwd = rec.get("gitBranch") or "", rec.get("cwd")
                 if cwd and branch not in DEFAULT_BRANCHES:
                     branches[(cwd, branch)] = None
-                    for t in CU_ID.findall(branch):
-                        tickets.setdefault(t, f"https://app.clickup.com/t/{t}")
+                    for t in TICKETS["tag"].findall(branch):
+                        tickets.setdefault(t, TICKETS["url"].format(id=t))
                 if rec.get("type") not in ("user", "assistant"):
                     continue
                 for text in said(rec):
-                    for m in CLICKUP_URL.finditer(text):
+                    for m in TICKETS["link"].finditer(text):
                         tickets.setdefault(m.group(1), m.group(0))
                 content = (rec.get("message") or {}).get("content")
                 for c in content if isinstance(content, list) else []:
@@ -92,8 +82,8 @@ def scan(sid):
                         continue
                     cmd = (c.get("input") or {}).get("command") or ""
                     if "git commit" in cmd:
-                        for t in CU_ID.findall(cmd):
-                            tickets.setdefault(t, f"https://app.clickup.com/t/{t}")
+                        for t in TICKETS["tag"].findall(cmd):
+                            tickets.setdefault(t, TICKETS["url"].format(id=t))
     return {"prs": list(prs), "tickets": tickets, "branches": list(branches)}
 
 

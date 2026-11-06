@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **herdr terminal:** with `"terminal": "herdr"` (or inside herdr, which roost detects by `HERDR_ENV`), each project gets a herdr workspace and each Session a tab in it; opening a Session again goes to its tab
+- **Herdr app terminal:** with `"terminal": "herdr-app"` (or inside the Herdr desktop app, detected by `HC_TERMINAL_ID`), each project gets a space and each Session a tab, driven by `herdr-app do`. A Session open in a window can be minimized from its actions (its tab goes away and it keeps running) and restored to its space later. IDE variables inherited into herdr no longer make roost act as an IDE terminal
+- **Clicks in the Herdr app:** roost asks only for SGR mouse reports there, so clicks keep working after switching spaces (Herdr changed to urxvt's encoding once a tab lost and regained focus, which Textual can't read)
+- **Rollover:** with `"rollover": true`, a prompt sent to a big project Session whose cache has gone cold is held back: roost writes the Session's Handoff (unless the newest one already covers it) and opens a fresh Session in the project with the prompt waiting under `## Waiting prompt` in its brief. A prompt starting with `>>` goes to the cold Session anyway; `rollover_tokens` (100000) sets the size
+- **Checkpoints:** with `"checkpoint": true`, a project Session that keeps working gets a Handoff about once an hour (`checkpoint_minutes`), written in the background from its Stop hook, so a crash or a forgotten `/wrap-up` costs at most that hour. It writes the Handoff only; the README waits for `/wrap-up`. A failed checkpoint waits the interval before trying again
+- **PRs and tickets in the Herdr app:** `roost setup herdr` installs the roost-links mod, a bar over the window showing the focused Session's PRs (the ones it linked, and every PR on the branches it ran on, from `gh`, with their state) and tickets (ClickUp links it mentioned, and `CU-<id>` in its branches and commits) as chips that open in the browser. Setup asks before adding the bar to a layout: one Herdr ships is copied as `<name>-roost` first, since Herdr rewrites its own. `roost links --terminal <t>` or `--session <id>` prints the same as JSON
+
 ## 2026.11.02
 
 - **Sessions rows:** the views are words over the table, the current one underlined, each with its count. The table sits in an outline with the view in its top edge. Each Session takes two lines, its row and then its status mark and last message; STATUS is no longer a column, and the panel no longer repeats the last message

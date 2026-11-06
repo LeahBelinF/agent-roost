@@ -1567,39 +1567,74 @@ class TopTabs(unittest.TestCase):
 
 
 @unittest.skipUnless(roost.App, "Textual isn't installed here: run the tests with ~/.roost/venv/bin/python")
-class HerdrAppMouse(unittest.TestCase):
-    """In the Herdr app, roost asks only for SGR mouse reports (1006), never urxvt's (1015): after its tab
-    loses focus and gets it back, Herdr reports in urxvt's encoding when both are on, which Textual can't
-    read, so every click after the first space switch was dropped."""
-    def mouse_modes(self, driver):
+class HerdrMouse(unittest.TestCase):
+    """Inside the Herdr app (HC_TERMINAL_ID set) roost asks only for SGR mouse reports: with urxvt's 1015 on
+    too, Herdr switches to urxvt's encoding after a tab regains focus, and Textual reads only SGR."""
+    WANTED, URXVT = ("\x1b[?1000h", "\x1b[?1003h", "\x1b[?1006h"), "\x1b[?1015h"
+
+    def setUp(self):
+        import unittest.mock
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        stubs = dict(read_projects=lambda sessions: [], read_recaps=lambda: [], plugin_problem=lambda: "",
+                     check_compat=lambda: "", plugin_registered=lambda s=None: True, taken_plugin_change=lambda: "",
+                     retention=lambda: (30, None), update_available=lambda: "", chosen_terminal=lambda: "ghostty",
+                     mark_open=lambda ss, term: ss, regather=lambda old: old, read_config=lambda: {},
+                     save_config=lambda **kw: None, NOTES=Path(tmp.name) / "notes",
+                     gather_spend=lambda table=None, now=None: {"rows": [], "hours": {}, "tokens": {},
+                                                                "unpriced": [], "priced": True})
+        patcher = unittest.mock.patch.multiple(roost, **stubs)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def app_in(self, hc_terminal_id):
+        """A RoostApp made with HC_TERMINAL_ID set to the value given, or unset for None."""
+        import unittest.mock
+        env = {k: v for k, v in os.environ.items() if k != "HC_TERMINAL_ID"}
+        if hc_terminal_id is not None:
+            env["HC_TERMINAL_ID"] = hc_terminal_id
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            app = roost.RoostApp([], "")
+            return app, app.get_driver_class()
+
+    def mouse_writes(self, driver_class, mouse):
+        """What the driver's own mouse hook writes, without a terminal: Textual's __init__ grabs stdin and
+        signal handlers, so the driver is made bare with just the attributes the hook uses."""
+        drv = driver_class.__new__(driver_class)
         sent = []
-        fake = type("Fake", (), {"_mouse": True, "write": lambda self, d: sent.append(d),
-                                 "flush": lambda self: None})()
-        driver._enable_mouse_support(fake)
+        drv._mouse, drv.write, drv.flush = mouse, sent.append, lambda: None
+        drv._enable_mouse_support()
         return "".join(sent)
 
-    def test_the_herdr_app_gets_the_herdr_driver(self):
-        import unittest.mock
-        with unittest.mock.patch.dict(os.environ, {"HC_TERMINAL_ID": "t1"}):
-            self.assertIs(roost.RoostApp([], "").driver_class, roost.HerdrDriver)
+    def test_inside_herdr_the_app_uses_the_herdr_driver_a_linux_driver(self):
+        from textual.drivers.linux_driver import LinuxDriver
+        app, chosen = self.app_in("terminal-1")
+        self.assertIs(app.driver_class, roost.HerdrDriver)
+        self.assertIs(chosen, roost.HerdrDriver)
+        self.assertTrue(issubclass(roost.HerdrDriver, LinuxDriver))
 
-    def test_other_terminals_keep_textuals_driver(self):
-        import unittest.mock
-        with unittest.mock.patch.dict(os.environ, {"HC_TERMINAL_ID": ""}):
-            self.assertIsNot(roost.RoostApp([], "").driver_class, roost.HerdrDriver)
+    def test_inside_herdr_mouse_on_asks_for_sgr_and_never_urxvt(self):
+        app, _ = self.app_in("terminal-1")
+        out = self.mouse_writes(app.driver_class, mouse=True)
+        for seq in self.WANTED:
+            self.assertIn(seq, out, repr(out))
+        self.assertNotIn(self.URXVT, out, repr(out))
 
-    def test_the_herdr_driver_asks_for_sgr_and_not_urxvt_reports(self):
-        modes = self.mouse_modes(roost.HerdrDriver)
-        for mode in ("\x1b[?1000h", "\x1b[?1003h", "\x1b[?1006h"):
-            self.assertIn(mode, modes)
-        self.assertNotIn("\x1b[?1015h", modes)
+    def test_inside_herdr_mouse_off_writes_no_mouse_modes(self):
+        app, _ = self.app_in("terminal-1")
+        out = self.mouse_writes(app.driver_class, mouse=False)
+        for seq in self.WANTED + (self.URXVT,):
+            self.assertNotIn(seq, out, repr(out))
 
-    def test_the_herdr_driver_asks_for_nothing_with_the_mouse_off(self):
-        sent = []
-        fake = type("Fake", (), {"_mouse": False, "write": lambda self, d: sent.append(d),
-                                 "flush": lambda self: None})()
-        roost.HerdrDriver._enable_mouse_support(fake)
-        self.assertEqual(sent, [])
+    def test_outside_herdr_the_app_keeps_textuals_own_driver(self):
+        from textual.app import App
+        for value in (None, ""):
+            with self.subTest(HC_TERMINAL_ID=value):
+                app, chosen = self.app_in(value)
+                stock = App.get_driver_class(app)
+                self.assertIs(chosen, stock)
+                self.assertIs(app.driver_class, stock)
+                self.assertIsNot(app.driver_class, roost.HerdrDriver)
 
 
 if __name__ == "__main__":

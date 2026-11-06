@@ -646,31 +646,57 @@ class StartingSessions(unittest.TestCase):
             self.assertIsNone(ui.open_one(s))
         self.assertEqual(scripts, ['tell application "Claude" to activate'] * 2)
 
-    def test_a_session_open_in_the_herdr_app_can_be_minimized_and_then_restored(self):
+    # minimizing in the Herdr app: offered for a Session open in a window, and Restore once it's minimized
+
+    def minimize_actions(self, s, term="herdr-app", recorded=None):
+        """The labels of s's actions with terminal term, config.MINIMIZED holding recorded ({} if None)."""
         import unittest.mock
         minimized = Path(self.tmp.name) / "minimized.json"
+        minimized.write_text(json.dumps(recorded or {}))
+        with unittest.mock.patch.object(roost.config, "MINIMIZED", minimized):
+            ui = self.ui(term=term)
+            ui.sessions = [s]
+            return [a for a, _ in ui.session_actions(s)]
+
+    def test_herdr_app_offers_minimize_for_a_session_open_in_a_window(self):
+        for s in (dict(session("Live", kind="interactive"), id="aa1b9a71-0000"),
+                  dict(session("Kept", attached=True), id="bb1b9a71-0000")):
+            with self.subTest(s["name"]):
+                acts = self.minimize_actions(s)
+                self.assertIn("Minimize its window", acts)
+                self.assertNotIn("Restore its window", acts)
+
+    def test_choosing_minimize_minimizes_that_session(self):
+        import unittest.mock
         s = dict(session("Live", kind="interactive"), id="aa1b9a71-0000")
-        with unittest.mock.patch.object(roost.terminals.config, "MINIMIZED", minimized, create=True):
+        minimized = Path(self.tmp.name) / "minimized.json"
+        parked = []
+        with unittest.mock.patch.object(roost.config, "MINIMIZED", minimized), \
+                unittest.mock.patch.object(roost.terminals, "app_minimize", lambda x: parked.append(x["id"]) or True):
             ui = self.ui(term="herdr-app")
             ui.sessions = [s]
-            acts = [a for a, _ in ui.session_actions(s)]
-            self.assertEqual(acts[0], "Go to its window")
-            self.assertIn("Minimize its window", acts)
-            parked = []
-            with unittest.mock.patch.object(roost.terminals, "app_minimize", lambda x: parked.append(x["id"]) or True):
-                dict(ui.session_actions(s))["Minimize its window"]()
-            self.assertEqual(parked, [s["id"]])
-            self.assertIn("Minimized Live", ui.msg)
-            minimized.write_text(json.dumps({s["id"]: {"terminal": "t7", "space": "p", "tab": "Live", "folder": "/x"}}))
-            acts = [a for a, _ in ui.session_actions(s)]
-            self.assertEqual(acts[0], "Restore its window")
-            self.assertNotIn("Minimize its window", acts)
+            dict(ui.session_actions(s))["Minimize its window"]()
+        self.assertEqual(parked, [s["id"]])
 
-    def test_only_the_herdr_app_offers_minimize(self):
+    def test_a_minimized_session_offers_restore_instead_of_minimize(self):
         s = dict(session("Live", kind="interactive"), id="aa1b9a71-0000")
-        ui = self.ui(term="ghostty")
-        ui.sessions = [s]
-        self.assertNotIn("Minimize its window", [a for a, _ in ui.session_actions(s)])
+        acts = self.minimize_actions(s, recorded={s["id"]: {"terminal": "t7", "space": "p", "tab": "Live", "folder": "/x"}})
+        self.assertEqual(acts[0], "Restore its window")
+        self.assertNotIn("Minimize its window", acts)
+        self.assertNotIn("Go to its window", acts)
+
+    def test_minimize_is_only_offered_in_the_herdr_app(self):
+        s = dict(session("Live", kind="interactive"), id="aa1b9a71-0000")
+        for term in ("ghostty", "herdr", None):
+            with self.subTest(term):
+                self.assertNotIn("Minimize its window", self.minimize_actions(s, term=term))
+
+    def test_minimize_is_not_offered_for_a_session_not_in_a_window(self):
+        self.assertNotIn("Minimize its window", self.minimize_actions(dict(session("Bg"), id="cc1b9a71-0000")))
+
+    def test_minimize_is_not_offered_for_a_claude_desktop_session(self):
+        s = dict(session("Budget", kind="interactive"), id="d-id", desktop=True)
+        self.assertNotIn("Minimize its window", self.minimize_actions(s))
 
     def test_stop_and_delete_are_actions_that_ask_first(self):
         self.project("p", handoffs=[time.strftime("%Y-%m-%d-%H%M") + "-aaaaaaaa.md"])
@@ -2313,83 +2339,183 @@ class HerdrAppTerminal(unittest.TestCase):
 
     # minimizing: a Session's tab goes away while it keeps running, and comes back in its project's space
 
-    def space_with(self, sid, name, tab_id, tab_name, terminal):
-        return {"id": sid, "name": name, "folder": "/x", "active": False,
-                "tabs": [{"id": tab_id, "name": tab_name, "active": False,
-                          "terminals": [{"terminal": terminal, "pane": "p1", "app": "claude-code", "sub_agents": []}]}]}
+    def space_with(self, sid, name, *tabs):
+        """A listed space; each tab is (tab id, tab name, [terminal addresses])."""
+        return {"id": sid, "name": name, "folder": f"/work/{name}", "active": False,
+                "tabs": [{"id": tid, "name": tname, "active": False,
+                          "terminals": [{"terminal": t, "pane": f"p-{t}", "app": "claude-code", "sub_agents": []}
+                                        for t in terms]} for tid, tname, terms in tabs]}
 
     def remembered(self):
         return json.loads(self.minimized.read_text()) if self.minimized.exists() else {}
 
-    def test_minimize_parks_the_terminal_of_the_sessions_tab_and_remembers_where_it_was(self):
-        self.spaces = [self.space_with("spP", "p", "tbS", "Fix it", "t7")]
+    def record(self, s, **entry):
+        self.minimized.write_text(json.dumps({s["id"]: dict({"terminal": "t7", "space": "p", "tab": "Fix it",
+                                                             "folder": "/work/p"}, **entry)}))
+
+    def stand_in(self, name, value):
+        """Replace name in every roost module that defines it (in all of them while none does), until cleanup."""
+        mods = [m for m in package.modules() if name in vars(m)]
+        for m in mods or package.modules():
+            if name in vars(m):
+                self.addCleanup(setattr, m, name, vars(m)[name])
+            else:
+                self.addCleanup(lambda m=m: vars(m).pop(name, None))
+            setattr(m, name, value)
+
+    def running(self, foreground, files=None):
+        """Herdr terminals as `hc get` reports them: foreground maps an address to its {pid, argv} (None for
+        no foreground; an address left out makes hc fail). files maps a pid to its ~/.claude/sessions Session id.
+        The real hc is never reached: PATH is emptied too."""
+        import unittest.mock
+        sessions = Path(self.tmp.name) / "claude-sessions"
+        sessions.mkdir(exist_ok=True)
+        for pid, sid in (files or {}).items():
+            (sessions / f"{pid}.json").write_text(json.dumps({"pid": pid, "sessionId": sid, "cwd": "/x"}))
+        self.hc_calls = []
+
+        def hc(*args):
+            self.hc_calls.append(list(args))
+            if args[:1] != ("get",) or args[1] not in foreground:
+                return None
+            return {"terminal": args[1], "foreground": foreground[args[1]]}
+        self.stand_in("hc", hc)
+        self.stand_in("CLAUDE_SESSIONS", sessions)
+        patcher = unittest.mock.patch.dict(os.environ, PATH=str(Path(self.tmp.name) / "no-bin"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def claude(self, pid, *args):
+        return {"pid": pid, "argv": ["claude", *args]}
+
+    # which Session a Herdr terminal is running
+
+    def test_terminal_session_reads_the_session_file_of_the_terminals_process_first(self):
+        self.running({"t1q": self.claude(501, "--resume", "old-id")}, files={501: "after-clear-id"})
+        self.assertEqual(roost.terminal_session("t1q"), "after-clear-id")
+        self.assertIn(["get", "t1q"], self.hc_calls)
+
+    def test_terminal_session_falls_back_to_the_session_named_in_the_argv(self):
+        for flag in ("--session-id", "--resume", "-r"):
+            with self.subTest(flag):
+                self.running({"t1q": self.claude(502, "--model", "opus", flag, "argv-id", "-n", "Fix it")})
+                self.assertEqual(roost.terminal_session("t1q"), "argv-id")
+
+    def test_terminal_session_is_none_when_nothing_names_a_session(self):
+        cases = [("hc fails", {}), ("no foreground", {"t1q": None}),
+                 ("claude with no session flag", {"t1q": self.claude(503, "--model", "opus")}),
+                 ("a shell", {"t1q": {"pid": 504, "argv": ["-zsh"]}})]
+        for what, foreground in cases:
+            with self.subTest(what):
+                self.running(foreground)
+                self.assertIsNone(roost.terminal_session("t1q"))
+
+    # minimizing: the tab of the terminal running the Session is parked, and where it was is recorded
+
+    def test_minimize_parks_the_terminal_running_the_session_and_records_where_it_was(self):
         s = self.sess(kind="interactive")
+        self.spaces = [self.space_with("spO", "other", ("tbO", "Notes", ["t3"])),
+                       self.space_with("spP", "p", ("tbA", "Build", ["t5"]), ("tbS", "Renamed by hand", ["t6", "t7"]))]
+        self.running({"t3": self.claude(1, "--resume", "someone-else"), "t5": None,
+                      "t6": {"pid": 2, "argv": ["-zsh"]}, "t7": self.claude(3, "--resume", s["id"])})
         self.assertTrue(roost.terminals.app_minimize(s))
         self.assertEqual([self.flag(c, "--terminal") for c in self.do("terminal.park")], ["t7"])
-        self.assertEqual(self.remembered()[s["id"]], {"terminal": "t7", "space": "p", "tab": "Fix it", "folder": "/x"})
-
-    def test_minimize_without_a_tab_for_the_session_parks_nothing(self):
-        self.spaces = [self.space_with("spP", "p", "tbS", "Something else", "t7")]
-        self.assertFalse(roost.terminals.app_minimize(self.sess(kind="interactive")))
-        self.assertEqual(self.do("terminal.park"), [])
-        self.assertEqual(self.remembered(), {})
-
-    def test_a_minimized_session_is_known_as_minimized(self):
-        self.spaces = [self.space_with("spP", "p", "tbS", "Fix it", "t7")]
-        s = self.sess(kind="interactive")
-        self.assertFalse(roost.terminals.is_minimized(s))
-        roost.terminals.app_minimize(s)
+        self.assertEqual(self.remembered(), {s["id"]: {"terminal": "t7", "space": "p", "tab": "Renamed by hand",
+                                                       "folder": "/work/p"}})
         self.assertTrue(roost.terminals.is_minimized(s))
 
-    def test_restore_into_its_existing_space_selects_it_keeps_the_terminal_as_a_tab_and_names_it(self):
-        self.spaces = [self.space_with("spP", "p", "tbS", "Fix it", "t7")]
+    def test_minimize_finds_a_session_by_any_of_its_ids(self):
+        s = self.sess(kind="interactive", ids=["00000000-0000-0000-0000-00000000aaaa", self.sess()["id"]])
+        self.spaces = [self.space_with("spP", "p", ("tbS", "Work", ["t7"]))]
+        self.running({"t7": self.claude(9, "--session-id", "00000000-0000-0000-0000-00000000aaaa")})
+        self.assertTrue(roost.terminals.app_minimize(s))
+        self.assertEqual([self.flag(c, "--terminal") for c in self.do("terminal.park")], ["t7"])
+        self.assertIn(s["id"], self.remembered())
+
+    def test_minimize_never_picks_a_tab_by_its_name(self):
+        s = self.sess(kind="interactive", ai_title="Fixing the thing")
+        self.spaces = [self.space_with("spP", "p", ("tbA", "Fix it", ["t5"]), ("tbB", "Fixing the thing", ["t6"]))]
+        self.running({"t5": self.claude(1, "--resume", "someone-else"), "t6": {"pid": 2, "argv": ["-zsh"]}})
+        self.assertFalse(roost.terminals.app_minimize(s))
+        self.assertEqual(self.do("terminal.park"), [])
+        self.assertEqual(self.remembered(), {})
+        self.assertFalse(roost.terminals.is_minimized(s))
+
+    def test_a_failed_park_records_nothing(self):
         s = self.sess(kind="interactive")
-        roost.terminals.app_minimize(s)
-        self.apps.clear()
-        self.assertTrue(roost.terminals.app_restore(s))
-        verbs = [c[1] for c in self.apps if c[0] == "do"]
-        self.assertEqual(verbs, ["space.select", "terminal.keep", "tab.rename"])  # select first, so the tab lands there
-        self.assertEqual(self.flag(self.do("space.select")[0], "--id"), "spP")
-        self.assertEqual(self.flag(self.do("terminal.keep")[0], "--terminal"), "t7")
-        self.assertEqual(self.flag(self.do("terminal.keep")[0], "--place"), "tab")
-        rename = self.do("tab.rename")[0]
-        self.assertEqual((self.flag(rename, "--id"), self.flag(rename, "--name")), ("tbKEPT", "Fix it"))
+        self.spaces = [self.space_with("spP", "p", ("tbS", "Fix it", ["t7"]))]
+        self.running({"t7": self.claude(3, "--resume", s["id"])})
+        real = self.fake_app
+        roost.terminals.herdr_app = lambda *a: None if a[:2] == ("do", "terminal.park") else real(*a)  # undone by cleanup
+        self.assertFalse(roost.terminals.app_minimize(s))
         self.assertEqual(self.remembered(), {})
 
-    def test_restore_when_its_space_closed_makes_the_space_and_closes_the_placeholder_tab(self):
-        self.spaces = [self.space_with("spP", "p", "tbS", "Fix it", "t7")]
+    def test_is_minimized_exactly_when_its_id_is_recorded(self):
         s = self.sess(kind="interactive")
-        roost.terminals.app_minimize(s)
-        self.spaces, self.apps[:] = [], []  # parking its only tab closed the space
+        self.assertFalse(roost.terminals.is_minimized(s))
+        self.record(dict(s, id="99999999-0000-0000-0000-000000000000"))
+        self.assertFalse(roost.terminals.is_minimized(s))
+        self.record(s)
+        self.assertTrue(roost.terminals.is_minimized(s))
+
+    # restoring: the parked terminal gets a tab again, in its space, named as before
+
+    def verbs(self):
+        return [c[1] for c in self.apps if c[0] == "do"]
+
+    def test_restore_into_its_space_selects_it_then_keeps_the_terminal_as_a_named_tab(self):
+        s = self.sess(kind="interactive")
+        self.record(s, tab="Renamed by hand")
+        self.spaces = [self.space_with("spO", "other"), self.space_with("spP", "p", ("tbA", "Build", ["t5"]))]
         self.assertTrue(roost.terminals.app_restore(s))
-        verbs = [c[1] for c in self.apps if c[0] == "do"]
-        self.assertEqual(verbs, ["space.new", "space.select", "terminal.keep", "tab.rename", "tab.close"])
+        self.assertEqual(self.verbs(), ["space.select", "terminal.keep", "tab.rename"])  # selected first: the tab lands there
+        self.assertEqual(self.flag(self.do("space.select")[0], "--id"), "spP")
+        keep = self.do("terminal.keep")[0]
+        self.assertEqual((self.flag(keep, "--terminal"), self.flag(keep, "--place")), ("t7", "tab"))
+        rename = self.do("tab.rename")[0]
+        self.assertEqual((self.flag(rename, "--id"), self.flag(rename, "--name")), ("tbKEPT", "Renamed by hand"))
+        self.assertEqual(self.remembered(), {})
+        self.assertFalse(roost.terminals.is_minimized(s))
+
+    def test_restore_when_its_space_is_gone_makes_it_and_closes_its_placeholder_tab(self):
+        s = self.sess(kind="interactive")
+        self.record(s)
+        self.spaces = [self.space_with("spO", "other")]
+        self.assertTrue(roost.terminals.app_restore(s))
+        self.assertEqual(self.verbs(), ["space.new", "space.select", "terminal.keep", "tab.rename", "tab.close"])
         made = self.do("space.new")[0]
-        self.assertEqual((self.flag(made, "--name"), self.flag(made, "--folder")), ("p", "/x"))
+        self.assertEqual((self.flag(made, "--name"), self.flag(made, "--folder")), ("p", "/work/p"))
         self.assertEqual(self.flag(self.do("space.select")[0], "--id"), "spNEW")
-        self.assertEqual(self.flag(self.do("tab.close")[0], "--id"), "tbNEW")
+        self.assertEqual(self.flag(self.do("terminal.keep")[0], "--terminal"), "t7")
+        close = self.do("tab.close")[0]
+        self.assertEqual((self.flag(close, "--id"), self.flag(close, "--confirmed")), ("tbNEW", "true"))
         self.assertEqual(self.remembered(), {})
 
     def test_restore_of_a_session_never_minimized_does_nothing(self):
+        self.spaces = [self.space_with("spP", "p")]
         self.assertFalse(roost.terminals.app_restore(self.sess(kind="interactive")))
-        self.assertEqual(self.do("terminal.keep"), [])
+        self.assertEqual(self.apps, [])
 
-    def test_a_failed_restore_keeps_the_record_so_it_can_be_tried_again(self):
-        self.spaces = [self.space_with("spP", "p", "tbS", "Fix it", "t7")]
+    def test_a_failed_restore_keeps_the_record_to_try_again(self):
         s = self.sess(kind="interactive")
-        roost.terminals.app_minimize(s)
-        self.down = True
-        self.assertFalse(roost.terminals.app_restore(s))
-        self.assertIn(s["id"], self.remembered())
+        real = self.fake_app
+        for spaces, failing in [([self.space_with("spP", "p")], "ls"), ([], "space.new"),
+                                ([self.space_with("spP", "p")], "space.select"), ([self.space_with("spP", "p")], "terminal.keep")]:
+            with self.subTest(failing):
+                self.record(s)
+                self.spaces = spaces
+                roost.terminals.herdr_app = lambda *a, f=failing: None if a[:1] == (f,) or a[1:2] == (f,) else real(*a)
+                self.assertFalse(roost.terminals.app_restore(s))
+                self.assertIn(s["id"], self.remembered())  # herdr_app is put back by cleanup
 
-    def test_going_to_a_minimized_sessions_window_restores_it(self):
-        self.spaces = [self.space_with("spP", "p", "tbS", "Fix it", "t7")]
+    def test_opening_a_minimized_session_restores_it(self):
         s = self.sess(kind="interactive")
-        roost.terminals.app_minimize(s)
-        self.spaces = []
-        msg = roost.terminals.open_in_window(s, "herdr-app", group="p")
-        self.assertEqual(len(self.do("terminal.keep")), 1)
-        self.assertIn("Restored", msg)
+        self.record(s)
+        self.spaces = [self.space_with("spP", "p", ("tbA", "Build", ["t5"]))]
+        roost.terminals.open_in_window(s, "herdr-app", group="p")
+        self.assertEqual([self.flag(c, "--terminal") for c in self.do("terminal.keep")], ["t7"])
+        self.assertEqual(self.do("tab.new") + self.do("space.new"), [])  # the running claude comes back; none is started
+        self.assertEqual(self.remembered(), {})
 
 
 if __name__ == "__main__":

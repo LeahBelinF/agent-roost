@@ -215,22 +215,42 @@ def shipped_layouts(home):
         return set()
 
 
+def agreed(question):
+    """Ask a yes/no question; only y or yes (any case) agrees, and no answer (EOF) means no."""
+    try:
+        return input(question).strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
+def by_hand(why):
+    return True, f"{why}. To add the bar yourself, put this block at the top of a layout's work column: {json.dumps(BAR)}"
+
+
 def herdr_layout(home):
-    """Add the bar to the layout the Herdr app shows. A shipped layout is copied as <name>-roost first
-    (Herdr's own way to change one) and the window switches to the copy. Returns what it did, for setup to print."""
+    """Add the bar to the layout the Herdr app shows, after asking. A shipped layout is copied as
+    <name>-roost first (Herdr's own way to change one, since it rewrites its own) and the window switches
+    to the copy. Returns (ok, what it did), for setup to print."""
     status = terminals.herdr_app("status")
     name = (status or {}).get("layout")
     if not name:
         return False, "Herdr isn't running, so no layout has the bar yet: rerun roost setup herdr with the app open"
     if name in shipped_layouts(home):
         mine = f"{name}-roost"
-        if (home / "layouts" / f"{mine}.json").exists():  # copied on an earlier run: show it again
+        if (home / "layouts" / f"{mine}.json").exists():  # copied on an earlier run
+            if not agreed(f"Switch the Herdr window to your {mine} layout, which has the PR and ticket bar? [y/N] "):
+                return by_hand(f"Left the {name} layout as it is")
             made = terminals.herdr_app("do", "layout.switch", json.dumps({"name": mine}))
-        else:  # layout.clone shows the copy too
-            made = terminals.herdr_app("do", "layout.clone", json.dumps({"name": name, "as": mine}))
+        else:
+            if not agreed(f"Add the PR and ticket bar? Herdr rewrites its own {name} layout, so it will be copied as "
+                          f"{mine} and the window switched to the copy. [y/N] "):
+                return by_hand(f"Left the {name} layout as it is")
+            made = terminals.herdr_app("do", "layout.clone", json.dumps({"name": name, "as": mine}))  # shows it too
         if made is None:
-            return False, f"Couldn't copy Herdr's {name} layout as {mine}: see ~/.cache/roost.log"
-        name = mine
+            return False, f"Couldn't switch Herdr to {mine}: see ~/.cache/roost.log"
+        name, asked = mine, True
+    else:
+        asked = False
     path = home / "layouts" / f"{name}.json"
     try:
         layout = json.loads(path.read_text())
@@ -238,6 +258,8 @@ def herdr_layout(home):
         return False, f"Couldn't read the {name} layout: {e}"
     if has_bar(layout):
         return True, f"The {name} layout has the bar"
+    if not asked and not agreed(f"Add the PR and ticket bar to your {name} layout? [y/N] "):
+        return by_hand(f"Left the {name} layout as it is")
     if not add_bar(layout):
         return False, f"The {name} layout has no top to put the bar on: add a block with mod roost-links yourself"
     path.write_text(json.dumps(layout, indent=2) + "\n")

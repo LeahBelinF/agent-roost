@@ -140,6 +140,31 @@ def herdr_app(*args):
     return out
 
 
+def hc(*args):
+    """Run `hc <args>` (herdr-core); its JSON output, or None when it fails, is missing, hangs, or isn't JSON."""
+    try:
+        r = subprocess.run(["hc", *args], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
+        out = json.loads(r.stdout) if r.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
+        config.log(f"hc {' '.join(args[:2])} failed: {e}")
+        return None
+    return out if isinstance(out, dict) else None
+
+
+def terminal_session(address):
+    """The Session id of the claude running in a Herdr terminal, or None. Its process's file in
+    ~/.claude/sessions comes first (it follows /clear); then a --session-id or --resume in its argv."""
+    fg = (hc("get", address) or {}).get("foreground")
+    if not isinstance(fg, dict):
+        return None
+    try:
+        return json.loads((config.CLAUDE_SESSIONS / f"{fg['pid']}.json").read_text())["sessionId"]
+    except (KeyError, OSError, ValueError, TypeError):
+        pass
+    argv = fg.get("argv") or []
+    return next((argv[i + 1] for i, a in enumerate(argv[:-1]) if a in ("--session-id", "--resume", "-r")), None)
+
+
 def app_spaces():
     listed = herdr_app("ls")
     return None if listed is None else listed.get("spaces", [])
@@ -190,14 +215,14 @@ def is_minimized(s):
 
 
 def app_minimize(s):
-    """Take s's tab away in the Herdr app, its terminal still running (terminal.park), and remember its
+    """Take the tab of the terminal running s away in the Herdr app, its terminal still running (terminal.park), and remember its
     space so app_restore can bring it back there. True when it was parked."""
-    names = [n for n in {s["name"], s.get("ai_title")} if n]
-    found = next(((sp, t) for sp, t in app_tabs() if t.get("name") in names and t.get("terminals")), None)
+    ids = {s["id"], *(s.get("ids") or [])}  # by the Session its terminal runs, never by a tab's name
+    found = next(((sp, t, term["terminal"]) for sp, t in app_tabs() for term in t.get("terminals") or []
+                  if term.get("terminal") and terminal_session(term["terminal"]) in ids), None)
     if not found:
         return False
-    space, tab = found
-    terminal = tab["terminals"][0]["terminal"]
+    space, tab, terminal = found
     if herdr_app("do", "terminal.park", "--terminal", terminal) is None:
         return False
     minimized = read_minimized()

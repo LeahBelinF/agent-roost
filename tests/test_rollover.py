@@ -273,6 +273,33 @@ class Rollover(unittest.TestCase):
         self.assertNotIn("Waiting prompt", self.brief("other"))
         self.assertIn("## Waiting prompt", self.brief("printers"))
 
+    # a Session's first prompt: Claude Code names a transcript that isn't written yet
+
+    def first_prompt_hook(self):
+        hook = self.hook("first question")
+        hook["transcript_path"] = str(roost.PROJECTS / "-w" / "not-written-yet.jsonl")
+        return hook
+
+    def test_a_transcript_that_does_not_exist_yet_lets_the_prompt_through(self):
+        self.assertIsNone(self.rollover.check(self.first_prompt_hook(), now=self.cold()))
+        self.assertEqual(self.spawned, [])
+
+    def test_no_transcript_path_lets_the_prompt_through(self):
+        hook = self.hook("first question")
+        del hook["transcript_path"]
+        self.assertIsNone(self.rollover.check(hook, now=self.cold()))
+        hook["transcript_path"] = None
+        self.assertIsNone(self.rollover.check(hook, now=self.cold()))
+        self.assertEqual(self.spawned, [])
+
+    def test_the_prompt_hook_logs_nothing_for_a_first_prompt(self):
+        out = io.StringIO()
+        with unittest.mock.patch("sys.stdin", io.StringIO(json.dumps(self.first_prompt_hook()))), \
+                contextlib.redirect_stdout(out):
+            code = roost.run_command("hook", ["prompt"])
+        self.assertEqual((code, out.getvalue()), (0, ""))
+        self.assertEqual(self.logged, [])
+
 
 class HookCommand(unittest.TestCase):
     """roost hook prompt: the UserPromptSubmit hook. A broken hook must never block a prompt."""
