@@ -40,6 +40,7 @@ from roost.core import sessiondata
 from roost.core import install
 from roost.core import terminals
 from roost.core import rollover
+from roost.core import links
 
 
 def plain(sessions, query):
@@ -56,9 +57,10 @@ def plain(sessions, query):
 Command = namedtuple("Command", "help flags run")
 COMMANDS = {
     "setup": Command("check prerequisites, choose the terminal and Projects folder, and install the plugin",
-                     lambda p: p.add_argument("step", nargs="?", choices=["plugin", "textual"],
+                     lambda p: p.add_argument("step", nargs="?", choices=["plugin", "textual", "herdr"],
                                               help="plugin: only install and register roost's Claude Code plugin; "
-                                                   "textual: only install Textual, which draws the screens, in ~/.roost/venv"),
+                                                   "textual: only install Textual, which draws the screens, in ~/.roost/venv; "
+                                                   "herdr: only install the roost-links mod in the Herdr app"),
                      lambda args: install.setup(args.step)),
     "update": Command("install the latest release (Homebrew: brew upgrade roost)",
                       lambda p: None, lambda args: install.self_update()),
@@ -77,6 +79,8 @@ COMMANDS = {
     "rollover": Command("write a Session's Handoff and start a fresh Session in its project with a prompt waiting "
                         "(the prompt hook runs it)",
                         lambda p: (p.add_argument("session"), p.add_argument("prompt")), rollover.rollover_command),
+    "links": Command("print a Session's PRs and tickets as JSON (Herdr's roost-links mod runs it)",
+                     links.links_flags, links.links_command),
     "adopt": Command("bring existing project folders into roost's project layout: plan, review each plan, then apply",
                      adopt_flags, adopt_command),
 }

@@ -178,6 +178,29 @@ def update_plugin(version):
     return 0
 
 
+HERDR_MOD = Path(__file__).resolve().parents[1] / "herdr" / "roost-links"
+
+
+def herdr_app_home():
+    return Path(os.environ.get("HERDR_APP_HOME") or Path.home() / ".config" / "herdr-app")
+
+
+def setup_herdr():
+    """roost setup herdr: copy the roost-links mod (a Session's PRs and tickets, over its tab) into the
+    Herdr app's mods. Herdr reloads a mod when its files change, so rerunning it updates the mod in place."""
+    home = herdr_app_home()
+    if not home.is_dir():
+        print(f"  \033[33m!\033[0m No Herdr app folder at {home}: open the Herdr app once, then rerun roost setup herdr.")
+        return 1
+    dest = home / "mods" / "roost-links"
+    dest.mkdir(parents=True, exist_ok=True)
+    for f in sorted(HERDR_MOD.iterdir()):
+        if f.is_file() and f.name != "jsconfig.json" and not f.name.endswith(".d.ts"):  # Herdr writes those
+            shutil.copyfile(f, dest / f.name)
+    print(f"  \033[32m✓\033[0m The roost-links mod is in {dest}: Herdr shows it as a bar over the tabs")
+    return 0
+
+
 def setup(only=None):
     """Interactive first-run setup: checks prerequisites, picks a terminal and the Projects folder,
     and installs the plugin. only="plugin" does just the plugin step."""
@@ -186,6 +209,8 @@ def setup(only=None):
         return setup_plugin()
     if only == "textual":
         return setup_textual()
+    if only == "herdr":
+        return setup_herdr()
     ok = lambda m: print(f"  \033[32m✓\033[0m {m}")
     bad = lambda m: print(f"  \033[33m!\033[0m {m}")
     print()

@@ -7,7 +7,7 @@ import importlib
 # every module, lowest first: a module imports names only from the ones before it
 MODULES = ["core.config", "core.wren", "core.github", "core.formatting", "core.mdfiles", "core.pricing", "core.sessiondata",
            "core.notedata", "core.projectdata", "core.taskdata", "core.statsdata", "core.plugin", "core.handoffs", "core.summaries", "core.advice",
-           "core.adopt", "core.terminals", "core.rollover", "core.install", "app.shell", "app.widgets", "tabs.sessions", "tabs.projects",
+           "core.adopt", "core.terminals", "core.rollover", "core.links", "core.install", "app.shell", "app.widgets", "tabs.sessions", "tabs.projects",
            "tabs.notes", "tabs.stats", "tabs.unfiled", "app.ui", "app.screen", "demo", "cli"]
 
 
