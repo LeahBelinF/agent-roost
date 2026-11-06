@@ -185,9 +185,69 @@ def herdr_app_home():
     return Path(os.environ.get("HERDR_APP_HOME") or Path.home() / ".config" / "herdr-app")
 
 
+BAR = {"id": "roost-links", "type": "block", "content": {"mod": "roost-links"}, "size": {"px": 28}}
+
+
+def has_bar(node):
+    return node.get("id") == BAR["id"] or any(has_bar(c) for c in node.get("children") or [])
+
+
+def add_bar(layout):
+    """Put the roost-links bar at the top of a layout tree: over the work column when the window is a
+    sidebar and a work column side by side, else at the top of a column root. False when neither fits."""
+    if has_bar(layout):
+        return True
+    kids = layout.get("children") or []
+    if layout.get("type") == "row" and kids and kids[-1].get("type") == "column":
+        kids[-1].setdefault("children", []).insert(0, dict(BAR))
+    elif layout.get("type") == "column":
+        layout.setdefault("children", []).insert(0, dict(BAR))
+    else:
+        return False
+    return True
+
+
+def shipped_layouts(home):
+    """The layouts Herdr ships (and rewrites on every start), so a bar added to them wouldn't stay."""
+    try:
+        return {k.split(":", 1)[1] for k in json.loads((home / "installed.json").read_text()) if k.startswith("layout:")}
+    except (OSError, ValueError, AttributeError):
+        return set()
+
+
+def herdr_layout(home):
+    """Add the bar to the layout the Herdr app shows. A shipped layout is copied as <name>-roost first
+    (Herdr's own way to change one) and the window switches to the copy. Returns what it did, for setup to print."""
+    status = terminals.herdr_app("status")
+    name = (status or {}).get("layout")
+    if not name:
+        return False, "Herdr isn't running, so no layout has the bar yet: rerun roost setup herdr with the app open"
+    if name in shipped_layouts(home):
+        mine = f"{name}-roost"
+        if (home / "layouts" / f"{mine}.json").exists():  # copied on an earlier run: show it again
+            made = terminals.herdr_app("do", "layout.switch", json.dumps({"name": mine}))
+        else:  # layout.clone shows the copy too
+            made = terminals.herdr_app("do", "layout.clone", json.dumps({"name": name, "as": mine}))
+        if made is None:
+            return False, f"Couldn't copy Herdr's {name} layout as {mine}: see ~/.cache/roost.log"
+        name = mine
+    path = home / "layouts" / f"{name}.json"
+    try:
+        layout = json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        return False, f"Couldn't read the {name} layout: {e}"
+    if has_bar(layout):
+        return True, f"The {name} layout has the bar"
+    if not add_bar(layout):
+        return False, f"The {name} layout has no top to put the bar on: add a block with mod roost-links yourself"
+    path.write_text(json.dumps(layout, indent=2) + "\n")
+    return True, f"Added the bar to the {name} layout" + (" (a copy of Herdr's, now shown)" if name.endswith("-roost") else "")
+
+
 def setup_herdr():
-    """roost setup herdr: copy the roost-links mod (a Session's PRs and tickets, over its tab) into the
-    Herdr app's mods. Herdr reloads a mod when its files change, so rerunning it updates the mod in place."""
+    """roost setup herdr: copy the roost-links mod (a Session's PRs and tickets) into the Herdr app's mods,
+    and put its bar in the layout the app shows. Herdr reloads mods and layouts when their files change,
+    so rerunning it updates both in place."""
     home = herdr_app_home()
     if not home.is_dir():
         print(f"  \033[33m!\033[0m No Herdr app folder at {home}: open the Herdr app once, then rerun roost setup herdr.")
@@ -197,8 +257,10 @@ def setup_herdr():
     for f in sorted(HERDR_MOD.iterdir()):
         if f.is_file() and f.name != "jsconfig.json" and not f.name.endswith(".d.ts"):  # Herdr writes those
             shutil.copyfile(f, dest / f.name)
-    print(f"  \033[32m✓\033[0m The roost-links mod is in {dest}: Herdr shows it as a bar over the tabs")
-    return 0
+    print(f"  \033[32m✓\033[0m The roost-links mod is in {dest}")
+    ok, said = herdr_layout(home)
+    print(f"  \033[{'32m✓' if ok else '33m!'}\033[0m {said}")
+    return 0 if ok else 1
 
 
 def setup(only=None):

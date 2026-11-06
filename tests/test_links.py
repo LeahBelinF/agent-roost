@@ -102,32 +102,92 @@ class Links(unittest.TestCase):
         self.assertEqual((code, json.loads(out.getvalue())), (0, {"session": None, "prs": [], "tickets": []}))
 
 
+GRID = {"id": "root", "type": "row", "children": [{"id": "sidebar", "type": "column", "children": []},
+                                                  {"id": "work", "type": "column", "children": [{"id": "grid-head"}]}]}
+
+
 class HerdrMod(unittest.TestCase):
-    """roost setup herdr copies the roost-links mod into the Herdr app's mods."""
+    """roost setup herdr copies the roost-links mod into the Herdr app and puts its bar in the shown layout."""
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.saved = os.environ.get("HERDR_APP_HOME")
+        self.home = Path(self.tmp.name)
+        (self.home / "layouts").mkdir()
+        self.saved = (os.environ.get("HERDR_APP_HOME"), roost.herdr_app, roost.LOG)
         os.environ["HERDR_APP_HOME"] = self.tmp.name
+        roost.LOG = self.home / "roost.log"
+        self.shown, self.did = "agents-grid", []
+        roost.herdr_app = self.fake_app
+        (self.home / "installed.json").write_text(json.dumps({"agents": {}, "layout:agents-grid": {}, "layout:main": {}}))
+        self.layout("agents-grid", GRID)
 
     def tearDown(self):
-        if self.saved is None:
+        home, roost.herdr_app, roost.LOG = self.saved
+        if home is None:
             os.environ.pop("HERDR_APP_HOME", None)
         else:
-            os.environ["HERDR_APP_HOME"] = self.saved
+            os.environ["HERDR_APP_HOME"] = home
         self.tmp.cleanup()
 
+    def layout(self, name, tree=None):
+        path = self.home / "layouts" / f"{name}.json"
+        if tree is not None:
+            path.write_text(json.dumps(tree))
+        return json.loads(path.read_text())
+
+    def fake_app(self, *args):
+        if args == ("status",):
+            return {"layout": self.shown} if self.shown else None
+        self.did.append(args[1])
+        cmd = json.loads(args[2])
+        if args[1] == "layout.clone":
+            self.layout(cmd["as"], self.layout(cmd["name"]))
+        self.shown = cmd.get("as") or cmd["name"]
+        return {"ok": True}
+
+    def setup(self):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = roost.setup_herdr()
+        return code, out.getvalue()
+
     def test_it_copies_the_mod(self):
-        with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(roost.setup_herdr(), 0)
-        dest = Path(self.tmp.name) / "mods" / "roost-links"
+        self.assertEqual(self.setup()[0], 0)
+        dest = self.home / "mods" / "roost-links"
         self.assertEqual(sorted(p.name for p in dest.iterdir()), ["main.js", "mod.json"])
         self.assertIn('"links", "--terminal"', (dest / "main.js").read_text())
 
+    def test_a_shipped_layout_is_copied_and_the_bar_goes_over_the_work_column(self):
+        self.setup()
+        self.assertEqual((self.did, self.shown), (["layout.clone"], "agents-grid-roost"))
+        work = self.layout("agents-grid-roost")["children"][1]
+        self.assertEqual([c["id"] for c in work["children"]], ["roost-links", "grid-head"])
+        self.assertEqual(self.layout("agents-grid"), GRID)  # Herdr's own is left alone
+
+    def test_rerunning_switches_to_the_copy_and_adds_no_second_bar(self):
+        self.setup()
+        self.shown = "agents-grid"
+        self.setup()
+        self.assertEqual((self.did, self.shown), (["layout.clone", "layout.switch"], "agents-grid-roost"))
+        work = self.layout("agents-grid-roost")["children"][1]
+        self.assertEqual([c["id"] for c in work["children"]], ["roost-links", "grid-head"])
+
+    def test_a_personal_layout_gets_the_bar_in_place(self):
+        self.layout("mine", {"id": "root", "type": "column", "children": [{"id": "main"}]})
+        self.shown = "mine"
+        self.setup()
+        self.assertEqual(self.did, [])
+        self.assertEqual([c["id"] for c in self.layout("mine")["children"]], ["roost-links", "main"])
+
+    def test_herdr_not_running_still_copies_the_mod_and_says_so(self):
+        self.shown = None
+        code, out = self.setup()
+        self.assertEqual(code, 1)
+        self.assertTrue((self.home / "mods" / "roost-links" / "main.js").exists())
+        self.assertIn("Herdr isn't running", out)
+
     def test_no_herdr_app_no_copy(self):
-        os.environ["HERDR_APP_HOME"] = str(Path(self.tmp.name) / "missing")
-        with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(roost.setup_herdr(), 1)
-        self.assertFalse((Path(self.tmp.name) / "missing").exists())
+        os.environ["HERDR_APP_HOME"] = str(self.home / "missing")
+        self.assertEqual(self.setup()[0], 1)
+        self.assertFalse((self.home / "missing").exists())
 
 
 if __name__ == "__main__":
