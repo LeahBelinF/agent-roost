@@ -37,6 +37,7 @@ ROOST_HOME = Path.home() / ".roost"
 RECAPS = ROOST_HOME / "sessions"  # where Session recaps were before they were notes; move_recaps empties it
 NOTES = ROOST_HOME / "notes"     # the person's own notes, until one is moved into a project's notes/
 DONE = ROOST_HOME / "_done"      # close-out files of closed projects
+MINIMIZED = ROOST_HOME / "minimized.json"  # Herdr app Sessions whose tab is parked: where to bring each back
 PLUGIN = ROOST_HOME / "plugin"   # roost's Claude Code plugin (dev-link.sh links it to a checkout)
 DEFAULT_PROJECTS = "~/.roost/projects"
 

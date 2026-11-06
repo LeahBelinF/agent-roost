@@ -627,6 +627,28 @@ def session_name(sid):
     return parse(path)["name"] if path else sid[:8]
 
 
+def waiting_path(pid):
+    return config.ROOST_HOME / "waiting" / f"{pid.replace('/', '--')}.md"
+
+
+def set_waiting(pid, text):
+    """Leave a prompt for the next Session that picks up pid (a rollover's held-back prompt)."""
+    path = waiting_path(pid)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
+def take_waiting(pid):
+    """The prompt waiting for pid, removed so only one Session gets it; None when there's none."""
+    path = waiting_path(pid)
+    try:
+        text = path.read_text()
+    except OSError:
+        return None
+    path.unlink(missing_ok=True)
+    return text
+
+
 def project_brief(args):
     try:
         target = find_project(args.id)
@@ -635,6 +657,10 @@ def project_brief(args):
         print(f"roost project brief: {e}", file=sys.stderr)
         return 1
     print(text, end="")
+    waiting = take_waiting(project_id(target)) if target.is_dir() else None
+    if waiting:
+        print(f"\n## Waiting prompt\n\nA rollover held this prompt back from the last Session; it's what the "
+              f"person wants to work on now:\n\n{waiting.rstrip()}")
     if args.session:
         try:
             added, moved = assign_session(args.session, session_name(args.session), target)

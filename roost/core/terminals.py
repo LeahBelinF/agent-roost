@@ -1,5 +1,5 @@
 """Terminals: which one, opening a Session in a window, and AppleScript."""
-import os, re, shlex, subprocess, time, uuid
+import json, os, re, shlex, subprocess, time, uuid
 from pathlib import Path
 
 from roost.core.sessiondata import launch_dir
@@ -30,7 +30,16 @@ def start_plain(cwd, term):
     if not term:
         return {"start": argv, "cwd": cwd}
     t = TERMINALS[term]
-    if osa(t["new"], cwd, *window_command(shlex.join(argv), os.path.basename(cwd.rstrip("/")) or cwd)) is None:
+    folder = os.path.basename(cwd.rstrip("/")) or cwd
+    if term == "herdr-app":
+        if not app_open(folder, folder, cwd, argv):
+            return f"Couldn't open a {t['label']} tab (is the Herdr app open?)"
+        return f"Started a Session in {short(cwd)}"
+    if term == "herdr":
+        if not herdr_open(folder, folder, cwd, shlex.join(argv)):
+            return f"Couldn't open a {t['label']} tab (is herdr running?)"
+        return f"Started a Session in {short(cwd)}"
+    if osa(t["new"], cwd, *window_command(shlex.join(argv), folder)) is None:
         return f"Couldn't open a {t['label']} window (check Automation permission, or run roost setup)"
     return f"Started a Session in {short(cwd)}"
 
@@ -48,10 +57,196 @@ def start_session(pid, cwd, term, name=None):
         projectdata.assign_session(sid, name, folder)
         return {"start": argv, "cwd": cwd}
     t = TERMINALS[term]
-    if osa(t["new"], cwd, *window_command(shlex.join(argv), name)) is None:
+    if term == "herdr-app":
+        if not app_open(pid, name, cwd, argv):
+            return f"Couldn't open a {t['label']} tab (is the Herdr app open?)"
+    elif term == "herdr":
+        if not herdr_open(pid, name, cwd, shlex.join(argv)):
+            return f"Couldn't open a {t['label']} tab (is herdr running?)"
+    elif osa(t["new"], cwd, *window_command(shlex.join(argv), name)) is None:
         return f"Couldn't open a {t['label']} window (check Automation permission, or run roost setup)"
     projectdata.assign_session(sid, name, folder)
     return f"Started a Session for {name} in {short(cwd)}"
+
+
+# ---------- herdr ----------
+# herdr is driven by its CLI, not AppleScript: one workspace per project (labelled with the project
+# id), one tab per Session (labelled with the Session's name, which is how roost finds it again).
+
+def herdr(*args):
+    """Run `herdr <args>`; the "result" of its JSON output, or None when it fails, is missing, or hangs."""
+    try:
+        r = subprocess.run(["herdr", *args], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        config.log(f"herdr {' '.join(args[:2])} failed: {e}")
+        return None
+    if r.returncode != 0:
+        config.log(f"herdr {' '.join(args[:2])} exited {r.returncode}: {r.stderr.strip()[:200]}")
+        return None
+    if not r.stdout.strip():  # some commands (pane run) print nothing when they work
+        return {}
+    try:
+        return json.loads(r.stdout).get("result")
+    except (ValueError, AttributeError):
+        config.log(f"herdr {' '.join(args[:2])} printed something other than JSON")
+        return None
+
+
+# herdr's server and the Herdr app's terminals keep the environment they were started in. Started from
+# inside a Claude Code session, they hand its markers to every claude run there, and Claude Code then
+# takes that claude for a child session and saves no transcript. So claude runs with them unset.
+CHILD_SESSION_VARS = ("CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_ENTRYPOINT",
+                      "CLAUDE_CODE_SSE_PORT", "CLAUDE_CODE_EXECPATH", "CLAUDE_CODE_SESSION_ATTENDED",
+                      "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_PID")
+UNSET_CHILD_SESSION = ["env", *(a for v in CHILD_SESSION_VARS for a in ("-u", v))]
+
+
+def herdr_open(group, label, cwd, cmd):
+    """Run cmd in a new tab labelled `label`, in the workspace labelled `group` (made if missing).
+    True when every herdr call worked."""
+    listed = herdr("workspace", "list")
+    if listed is None:
+        return False
+    ws = next((w for w in listed.get("workspaces", []) if w.get("label") == group), None)
+    if ws:
+        made = herdr("tab", "create", "--workspace", ws["workspace_id"], "--cwd", cwd, "--label", label, "--focus")
+        if not made or herdr("workspace", "focus", ws["workspace_id"]) is None:
+            return False
+    else:
+        made = herdr("workspace", "create", "--cwd", cwd, "--label", group, "--focus")
+        if not made or herdr("tab", "rename", made["tab"]["tab_id"], label) is None:
+            return False
+    return herdr("pane", "run", made["root_pane"]["pane_id"], f"{shlex.join(UNSET_CHILD_SESSION)} {cmd}") is not None
+
+
+# ---------- the Herdr desktop app ----------
+# A separate program from herdr, driven by its own CLI, herdr-app: one space per project, one tab per
+# Session, found again by the tab's name.
+
+def herdr_app(*args):
+    """Run `herdr-app <args>`; its JSON output, or None when it fails, is missing, hangs, or reports an error."""
+    try:
+        r = subprocess.run(["herdr-app", *args], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        config.log(f"herdr-app {' '.join(args[:2])} failed: {e}")
+        return None
+    try:
+        out = json.loads(r.stdout)
+    except ValueError:
+        out = None
+    if r.returncode != 0 or not isinstance(out, dict) or "error" in out:
+        config.log(f"herdr-app {' '.join(args[:2])} exited {r.returncode}: {(r.stdout or r.stderr).strip()[:200]}")
+        return None
+    return out
+
+
+def app_spaces():
+    listed = herdr_app("ls")
+    return None if listed is None else listed.get("spaces", [])
+
+
+def app_open(group, label, cwd, argv):
+    """Run argv in a new tab named `label`, in the space named `group` (made if missing).
+    True when every call worked."""
+    spaces = app_spaces()
+    if spaces is None:
+        return False
+    argv = [*UNSET_CHILD_SESSION, *argv]
+    space = next((s for s in spaces if s.get("name") == group), None)
+    if not space:
+        return herdr_app("do", "space.new", "--name", group, "--folder", cwd, "--tab", label,
+                         "--argv", json.dumps(argv)) is not None
+    return herdr_app("do", "tab.new", "--name", label, "--space", space["id"], "--folder", cwd,
+                     "--argv", json.dumps(argv)) is not None \
+        and herdr_app("do", "space.select", "--id", space["id"]) is not None
+
+
+def app_tabs():
+    """(space, tab) for every tab in the app."""
+    return [(s, t) for s in app_spaces() or [] for t in s.get("tabs", [])]
+
+
+def app_focus(names):
+    """Bring forward the tab named with one of names. True when one was found and selected."""
+    found = next(((s, t) for s, t in app_tabs() if t.get("name") in names), None)
+    return bool(found) and herdr_app("do", "space.select", "--id", found[0]["id"]) is not None \
+        and herdr_app("do", "tab.select", "--id", found[1]["id"]) is not None
+
+
+def read_minimized():
+    try:
+        return json.loads(config.MINIMIZED.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def write_minimized(minimized):
+    config.MINIMIZED.parent.mkdir(parents=True, exist_ok=True)
+    config.MINIMIZED.write_text(json.dumps(minimized, indent=2) + "\n")
+
+
+def is_minimized(s):
+    return s["id"] in read_minimized()
+
+
+def app_minimize(s):
+    """Take s's tab away in the Herdr app, its terminal still running (terminal.park), and remember its
+    space so app_restore can bring it back there. True when it was parked."""
+    names = [n for n in {s["name"], s.get("ai_title")} if n]
+    found = next(((sp, t) for sp, t in app_tabs() if t.get("name") in names and t.get("terminals")), None)
+    if not found:
+        return False
+    space, tab = found
+    terminal = tab["terminals"][0]["terminal"]
+    if herdr_app("do", "terminal.park", "--terminal", terminal) is None:
+        return False
+    minimized = read_minimized()
+    minimized[s["id"]] = {"terminal": terminal, "space": space["name"], "tab": tab["name"], "folder": space.get("folder")}
+    write_minimized(minimized)
+    return True
+
+
+def app_restore(s):
+    """Give a minimized Session's terminal a tab again, in its space (made again if parking closed it),
+    named as before. True when it's back; a failure keeps the record, so it can be tried again."""
+    entry = read_minimized().get(s["id"])
+    spaces = app_spaces() if entry else None
+    if spaces is None:
+        return False
+    space = next((sp for sp in spaces if sp.get("name") == entry["space"]), None)
+    placeholder = None
+    if space:
+        space_id = space["id"]
+    else:  # a space can't be made empty: make it with a shell, and close that tab once the Session is in
+        made = herdr_app("do", "space.new", "--name", entry["space"], "--folder", entry.get("folder") or os.path.expanduser("~"))
+        if made is None:
+            return False
+        space_id, placeholder = made["space"], made["tab"]
+    if herdr_app("do", "space.select", "--id", space_id) is None:  # terminal.keep puts the tab in the shown space
+        return False
+    kept = herdr_app("do", "terminal.keep", "--terminal", entry["terminal"], "--place", "tab")
+    if kept is None:
+        return False
+    if kept.get("tab"):
+        herdr_app("do", "tab.rename", "--id", kept["tab"], "--name", entry["tab"])
+    if placeholder:
+        herdr_app("do", "tab.close", "--id", placeholder, "--confirmed", "true")
+    minimized = read_minimized()
+    minimized.pop(s["id"], None)
+    write_minimized(minimized)
+    return True
+
+
+def herdr_tabs():
+    listed = herdr("tab", "list")
+    return [] if listed is None else listed.get("tabs", [])
+
+
+def herdr_focus(names):
+    """Bring forward the tab labelled with one of names. True when one was found and focused."""
+    tab = next((t for t in herdr_tabs() if t.get("label") in names), None)
+    return bool(tab) and herdr("workspace", "focus", tab["workspace_id"]) is not None \
+        and herdr("tab", "focus", tab["tab_id"]) is not None
 
 
 # ---------- terminals ----------
@@ -167,10 +362,24 @@ on run argv
 end run
 """,
     },
+    "herdr-app": {  # the Herdr desktop app, driven through herdr_app(); detected by HC_TERMINAL_ID
+        "label": "Herdr",
+        "app": None,
+        "term_program": None,
+    },
+    "herdr": {  # driven through herdr(), not AppleScript; detected by HERDR_ENV, not TERM_PROGRAM
+        "label": "herdr",
+        "app": None,
+        "term_program": None,
+    },
 }
 
 
 def detect_terminal():
+    if os.environ.get("HC_TERMINAL_ID"):  # the Herdr app also sets TERM_PROGRAM=ghostty, so it comes first
+        return "herdr-app"
+    if os.environ.get("HERDR_ENV") == "1":  # herdr runs inside another terminal, so it comes first
+        return "herdr"
     tp = os.environ.get("TERM_PROGRAM", "").lower()
     return next((k for k, v in TERMINALS.items() if v["term_program"] == tp), None)
 
@@ -187,6 +396,8 @@ def ide_terminal(env=None):
     """The IDE whose terminal roost runs in: "jetbrains" (IntelliJ and the rest), "vscode" (VS Code
     and Cursor), or None."""
     env = os.environ if env is None else env
+    if env.get("HERDR_ENV") == "1" or env.get("HC_TERMINAL_ID"):  # herdr can inherit an IDE's variables
+        return None
     if env.get("TERMINAL_EMULATOR", "").startswith("JetBrains"):
         return "jetbrains"
     return "vscode" if env.get("TERM_PROGRAM") == "vscode" else None
@@ -218,7 +429,11 @@ def app_running(app):
 
 def window_titles(term):
     """Titles of every open terminal tab. Claude doesn't report which background
-    sessions are attached to a window, so titles are one way to tell."""
+    sessions are attached to a window, so titles are one way to tell. In herdr, the tab labels."""
+    if term == "herdr-app":
+        return [t["name"] for _, t in app_tabs() if t.get("name")]
+    if term == "herdr":
+        return [t["label"] for t in herdr_tabs() if t.get("label")]
     if not term or not app_running(TERMINALS[term]["app"]):
         return []
     out = osa(TERMINALS[term]["titles"]) or ""
@@ -251,19 +466,33 @@ def window_command(cmd, title):
     return line, direct
 
 
-def open_in_window(s, term):
-    """Open the session in a new window of `term` without leaving roost. Returns a status message."""
+def open_in_window(s, term, group=None):
+    """Open the session in a new window of `term` without leaving roost. Returns a status message.
+    group is the herdr workspace to open it in (the Session's project); other terminals ignore it."""
     if s.get("desktop"):
         return go_to_desktop(s)
     t = TERMINALS[term]
     if s["kind"] == "interactive" or s.get("attached"):
         names = [n for n in {s["name"], s.get("ai_title")} if n]
-        if osa(t["focus"], *names) == "ok":
+        if term == "herdr-app":
+            if is_minimized(s):
+                return f"Restored {s['name']}" if app_restore(s) else f"Couldn't restore {s['name']} (is the Herdr app open?)"
+            found = app_focus(names)
+        else:
+            found = herdr_focus(names) if term == "herdr" else osa(t["focus"], *names) == "ok"
+        if found:
             return f"Switched to {s['name']}, already open"
         return f"{s['name']} is already open, but its window wasn't found"
     cmd = f"claude attach {s['attach']}" if s.get("attach") else f"claude --resume {s['id']}"
     cwd = launch_dir(s)
-    if osa(t["new"], cwd, *window_command(cmd, s["name"])) is None:
+    if term == "herdr-app":
+        argv = ["claude", "attach", s["attach"]] if s.get("attach") else ["claude", "--resume", s["id"]]
+        if not app_open(group or os.path.basename(cwd.rstrip("/")) or cwd, s["name"], cwd, argv):
+            return f"Couldn't open a {t['label']} tab (is the Herdr app open?)"
+    elif term == "herdr":
+        if not herdr_open(group or os.path.basename(cwd.rstrip("/")) or cwd, s["name"], cwd, cmd):
+            return f"Couldn't open a {t['label']} tab (is herdr running?)"
+    elif osa(t["new"], cwd, *window_command(cmd, s["name"])) is None:
         return f"Couldn't open a {t['label']} window (check Automation permission, or run roost setup)"
     s["opening"] = time.time()
     return f"Opened {s['name']} in a new window"

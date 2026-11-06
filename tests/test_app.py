@@ -221,8 +221,9 @@ class Updates(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.dir = Path(self.tmp.name)
         self.saved = (roost.UPDATE_CHECK, roost.latest_release, roost.download_tarball, roost.VERSION, roost.update_plugin,
-                      roost.update_textual, roost.APP)
+                      roost.update_textual, roost.APP, roost.BREW)
         roost.UPDATE_CHECK, roost.APP = self.dir / "check.json", self.dir / "app"
+        roost.BREW = False  # a non-Homebrew install, whatever ROOST_INSTALL the test shell inherited
         self.textual_updates = []
         roost.update_textual = lambda me: self.textual_updates.append(me) or 0
         roost.VERSION = "2026.10.03"
@@ -231,7 +232,7 @@ class Updates(unittest.TestCase):
 
     def tearDown(self):
         (roost.UPDATE_CHECK, roost.latest_release, roost.download_tarball, roost.VERSION, roost.update_plugin, roost.update_textual,
-         roost.APP) = self.saved
+         roost.APP, roost.BREW) = self.saved
         self.tmp.cleanup()
 
     def test_newer_release_is_reported_and_cached(self):

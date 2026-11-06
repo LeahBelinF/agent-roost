@@ -39,6 +39,7 @@ from roost.core import projectdata
 from roost.core import sessiondata
 from roost.core import install
 from roost.core import terminals
+from roost.core import rollover
 
 
 def plain(sessions, query):
@@ -71,6 +72,11 @@ COMMANDS = {
                     note_flags, note_command),
     "ledger": Command("print a project's timeline: every Handoff's facts, oldest first",
                       ledger_flags, ledger_command),
+    "hook": Command("run a Claude Code hook for roost's plugin: hook prompt (UserPromptSubmit: rollover of cold Sessions)",
+                    lambda p: p.add_argument("event", choices=["prompt"]), rollover.hook_command),
+    "rollover": Command("write a Session's Handoff and start a fresh Session in its project with a prompt waiting "
+                        "(the prompt hook runs it)",
+                        lambda p: (p.add_argument("session"), p.add_argument("prompt")), rollover.rollover_command),
     "adopt": Command("bring existing project folders into roost's project layout: plan, review each plan, then apply",
                      adopt_flags, adopt_command),
 }

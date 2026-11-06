@@ -646,6 +646,32 @@ class StartingSessions(unittest.TestCase):
             self.assertIsNone(ui.open_one(s))
         self.assertEqual(scripts, ['tell application "Claude" to activate'] * 2)
 
+    def test_a_session_open_in_the_herdr_app_can_be_minimized_and_then_restored(self):
+        import unittest.mock
+        minimized = Path(self.tmp.name) / "minimized.json"
+        s = dict(session("Live", kind="interactive"), id="aa1b9a71-0000")
+        with unittest.mock.patch.object(roost.terminals.config, "MINIMIZED", minimized, create=True):
+            ui = self.ui(term="herdr-app")
+            ui.sessions = [s]
+            acts = [a for a, _ in ui.session_actions(s)]
+            self.assertEqual(acts[0], "Go to its window")
+            self.assertIn("Minimize its window", acts)
+            parked = []
+            with unittest.mock.patch.object(roost.terminals, "app_minimize", lambda x: parked.append(x["id"]) or True):
+                dict(ui.session_actions(s))["Minimize its window"]()
+            self.assertEqual(parked, [s["id"]])
+            self.assertIn("Minimized Live", ui.msg)
+            minimized.write_text(json.dumps({s["id"]: {"terminal": "t7", "space": "p", "tab": "Live", "folder": "/x"}}))
+            acts = [a for a, _ in ui.session_actions(s)]
+            self.assertEqual(acts[0], "Restore its window")
+            self.assertNotIn("Minimize its window", acts)
+
+    def test_only_the_herdr_app_offers_minimize(self):
+        s = dict(session("Live", kind="interactive"), id="aa1b9a71-0000")
+        ui = self.ui(term="ghostty")
+        ui.sessions = [s]
+        self.assertNotIn("Minimize its window", [a for a, _ in ui.session_actions(s)])
+
     def test_stop_and_delete_are_actions_that_ask_first(self):
         self.project("p", handoffs=[time.strftime("%Y-%m-%d-%H%M") + "-aaaaaaaa.md"])
         ui = self.ui()
@@ -1615,6 +1641,755 @@ class SessionRows(unittest.TestCase):
         self.assertIn("Context", text)
         self.assertTrue(any(self.TONER_PLAIN in l for l in above), "the list shows its last message")
         self.assertNotIn("Swapped the", text, "the panel doesn't")
+
+
+_REAL_HERDR = roost.terminals.herdr  # the real boundary, for the tests that fake subprocess.run instead
+
+# The variables that make a claude think it's a child session (and so not save its transcript). herdr's
+# terminals can inherit them from whatever Claude Code session started herdr, so roost unsets them itself.
+CHILD_SESSION_VARS = ("CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_ENTRYPOINT",
+                      "CLAUDE_CODE_SSE_PORT", "CLAUDE_CODE_EXECPATH", "CLAUDE_CODE_SESSION_ATTENDED",
+                      "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_PID")
+
+
+def roost_environments():
+    """Run the loop body once with roost's own environment holding every child-session variable (plus ones
+    that must be left alone), once with none of them: what herdr is handed must not depend on either."""
+    import unittest.mock
+    inherited = dict({n: "1" for n in CHILD_SESSION_VARS}, CLAUDE_CODE_ENABLE_TELEMETRY="1")
+    with unittest.mock.patch.dict(os.environ, inherited):
+        yield "with the variables set"
+    with unittest.mock.patch.dict(os.environ):
+        for n in CHILD_SESSION_VARS:
+            os.environ.pop(n, None)
+        yield "with none of them set"
+
+
+def assert_runs_claude_without_child_vars(test, argv, claude_argv):
+    """argv is `env -u NAME ...` unsetting exactly the child-session variables, then claude_argv unchanged."""
+    test.assertEqual(argv[:1], ["env"], argv)
+    names, i = [], 1
+    while i < len(argv) and argv[i] == "-u":
+        names.append(argv[i + 1])
+        i += 2
+    test.assertEqual(sorted(names), sorted(CHILD_SESSION_VARS), argv)  # each once; PATH, telemetry etc. untouched
+    test.assertEqual(argv[i:], claude_argv, argv)
+
+
+class HerdrTerminal(unittest.TestCase):
+    """herdr as a roost terminal: one workspace per project (labelled with the project id), one tab per
+    Session (labelled with its name), all driven through terminals.herdr, the one boundary the tests replace."""
+    README = "---\nsummary: s\nsessions: []\nstatus: active\n---\n\n# p\n"
+
+    def setUp(self):
+        import unittest.mock
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name)
+        self.saved = roost.CONFIG, roost.DONE, roost.RECAPS, roost.PLUGIN, roost.PROJECTS, roost.claude_settings, roost.NOTES
+        roost.CONFIG, roost.DONE, roost.RECAPS, roost.NOTES = base / "config.json", base / "_done", base / "sessions", base / "notes"
+        roost.claude_settings = lambda: {}
+        roost.PLUGIN, roost.PROJECTS = base / "plugin", base / "transcripts"
+        (roost.PLUGIN / ".claude-plugin").mkdir(parents=True)
+        (roost.PLUGIN / ".claude-plugin" / "plugin.json").write_text("{}")
+        self.root = base / "projects"
+        self.root.mkdir()
+        roost.save_config(projects_dir=str(self.root))
+        self.folder = self.root / "p"
+        (self.folder / "handoffs").mkdir(parents=True)
+        (self.folder / "README.md").write_text(self.README)
+        self.workdir = base / "work" / "repo"
+        self.workdir.mkdir(parents=True)
+        self.cwd = str(self.workdir)
+        self.calls, self.herdr_down, self.workspaces, self.tabs = [], False, [], []
+        self.osa_calls = []
+        patches = [unittest.mock.patch.object(roost.terminals, "herdr", self.fake_herdr),
+                   unittest.mock.patch.object(roost.terminals, "osa", lambda *a: self.osa_calls.append(a) or "ok")]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def tearDown(self):
+        roost.CONFIG, roost.DONE, roost.RECAPS, roost.PLUGIN, roost.PROJECTS, roost.claude_settings, roost.NOTES = self.saved
+        self.tmp.cleanup()
+
+    def fake_herdr(self, *args):
+        self.calls.append(list(args))
+        if self.herdr_down:
+            return None
+        cmd = args[:2]
+        if cmd == ("workspace", "list"):
+            return {"type": "workspace_list", "workspaces": self.workspaces}
+        if cmd == ("tab", "list"):
+            return {"type": "tab_list", "tabs": self.tabs}
+        if cmd == ("workspace", "create"):
+            return {"type": "workspace_created", "workspace": {"workspace_id": "w9", "label": "x"},
+                    "tab": {"tab_id": "w9:t1", "workspace_id": "w9", "label": "1"},
+                    "root_pane": {"pane_id": "w9:p1", "tab_id": "w9:t1", "workspace_id": "w9"}}
+        if cmd == ("tab", "create"):
+            return {"type": "tab_created", "tab": {"tab_id": "w1:t7", "workspace_id": "w1", "label": "x"},
+                    "root_pane": {"pane_id": "w1:p7", "tab_id": "w1:t7", "workspace_id": "w1"}}
+        return {"type": "ok"}
+
+    def made(self, *cmd):
+        """The args of every herdr call that starts with cmd, in order."""
+        return [c for c in self.calls if tuple(c[:len(cmd)]) == cmd]
+
+    def flag(self, call, name):
+        """The value after --name in a call."""
+        return call[call.index(name) + 1]
+
+    def project_sessions(self):
+        return roost.frontmatter((self.folder / "README.md").read_text())["sessions"]
+
+    # the terminal exists and is detected
+
+    def test_herdr_is_a_listed_terminal(self):
+        self.assertEqual(roost.terminals.TERMINALS["herdr"]["label"], "herdr")
+
+    def test_herdr_env_wins_over_the_outer_terminal(self):
+        import unittest.mock
+        with unittest.mock.patch.dict(os.environ, {"HERDR_ENV": "1", "TERM_PROGRAM": "iTerm.app"}):
+            os.environ.pop("HC_TERMINAL_ID", None)
+            self.assertEqual(roost.terminals.detect_terminal(), "herdr")
+
+    def test_without_herdr_env_the_outer_terminal_is_detected(self):
+        import unittest.mock
+        with unittest.mock.patch.dict(os.environ, {"TERM_PROGRAM": "iTerm.app"}):
+            os.environ.pop("HERDR_ENV", None)
+            os.environ.pop("HC_TERMINAL_ID", None)
+            self.assertEqual(roost.terminals.detect_terminal(), "iterm2")
+
+    # starting a Session
+
+    def test_start_in_an_existing_workspace_adds_a_tab_there_and_runs_claude(self):
+        self.workspaces = [{"workspace_id": "w1", "label": "other"}, {"workspace_id": "w2", "label": "p"}]
+        msg = roost.terminals.start_session("p", self.cwd, "herdr", "Fix it")
+        self.assertEqual(self.made("workspace", "create"), [])
+        (tab,) = self.made("tab", "create")
+        self.assertEqual((self.flag(tab, "--workspace"), self.flag(tab, "--cwd"), self.flag(tab, "--label")),
+                         ("w2", self.cwd, "Fix it"))
+        self.assertIn("--focus", tab)
+        (focus,) = self.made("workspace", "focus")
+        self.assertEqual(focus[2], "w2")
+        (run,) = self.made("pane", "run")
+        self.assertEqual(run[2], "w1:p7")
+        sid = re.search(r"--session-id ([0-9a-f-]{36})", run[3]).group(1)
+        self.assertIn("/roost:pickup p", run[3])
+        self.assertLess(self.calls.index(tab), self.calls.index(focus))
+        self.assertLess(self.calls.index(focus), self.calls.index(run))
+        self.assertFalse(msg.startswith("Couldn't"))
+        self.assertEqual(self.project_sessions()[-1], {"name": "Fix it", "id": sid})
+
+    def test_start_without_a_workspace_creates_one_and_renames_its_first_tab(self):
+        self.workspaces = [{"workspace_id": "w1", "label": "other"}]
+        msg = roost.terminals.start_session("p", self.cwd, "herdr", "Fix it")
+        (create,) = self.made("workspace", "create")
+        self.assertEqual((self.flag(create, "--cwd"), self.flag(create, "--label")), (self.cwd, "p"))
+        self.assertIn("--focus", create)
+        self.assertEqual(self.made("tab", "create"), [])
+        (rename,) = self.made("tab", "rename")
+        self.assertEqual(rename[2:], ["w9:t1", "Fix it"])
+        (run,) = self.made("pane", "run")
+        self.assertEqual(run[2], "w9:p1")
+        self.assertIn("/roost:pickup p", run[3])
+        self.assertLess(self.calls.index(create), self.calls.index(rename))
+        self.assertLess(self.calls.index(rename), self.calls.index(run))
+        self.assertFalse(msg.startswith("Couldn't"))
+        self.assertEqual(len(self.project_sessions()), 1)
+
+    def test_start_names_the_tab_after_the_project_when_no_name_is_given(self):
+        self.workspaces = []
+        roost.terminals.start_session("p", self.cwd, "herdr")
+        self.assertEqual(self.made("tab", "rename")[0][2:], ["w9:t1", "p"])
+
+    def test_a_failed_herdr_call_records_nothing(self):
+        self.herdr_down = True
+        msg = roost.terminals.start_session("p", self.cwd, "herdr", "Fix it")
+        self.assertTrue(msg.startswith("Couldn't open"))
+        self.assertEqual(self.project_sessions(), [])
+
+    def test_a_herdr_call_failing_mid_way_records_nothing(self):
+        self.workspaces = [{"workspace_id": "w2", "label": "p"}]
+        real = self.fake_herdr
+        roost.terminals.herdr = lambda *a: None if a[:2] == ("pane", "run") else real(*a)  # patched; undone by cleanup
+        msg = roost.terminals.start_session("p", self.cwd, "herdr", "Fix it")
+        self.assertTrue(msg.startswith("Couldn't open"))
+        self.assertEqual(self.project_sessions(), [])
+
+    def test_start_never_goes_through_applescript(self):
+        self.workspaces = []
+        roost.terminals.start_session("p", self.cwd, "herdr", "Fix it")
+        self.assertEqual(self.osa_calls, [])
+
+    # a Session with no project
+
+    def test_plain_start_labels_workspace_and_tab_with_the_folder_name(self):
+        self.workspaces = []
+        msg = roost.terminals.start_plain(self.cwd, "herdr")
+        (create,) = self.made("workspace", "create")
+        self.assertEqual(self.flag(create, "--label"), "repo")
+        self.assertEqual(self.made("tab", "rename")[0][2:], ["w9:t1", "repo"])
+        (run,) = self.made("pane", "run")
+        self.assertEqual(run[2], "w9:p1")
+        self.assertIn("claude", run[3])
+        self.assertNotIn("--session-id", run[3])
+        self.assertFalse(msg.startswith("Couldn't"))
+
+    def test_plain_start_reuses_the_folders_workspace(self):
+        self.workspaces = [{"workspace_id": "w3", "label": "repo"}]
+        roost.terminals.start_plain(self.cwd, "herdr")
+        self.assertEqual(self.made("workspace", "create"), [])
+        (tab,) = self.made("tab", "create")
+        self.assertEqual((self.flag(tab, "--workspace"), self.flag(tab, "--label")), ("w3", "repo"))
+        self.assertEqual(self.made("workspace", "focus")[0][2], "w3")
+        self.assertEqual(self.made("pane", "run")[0][2], "w1:p7")
+
+    # opening an existing Session
+
+    def sess(self, **kw):
+        return dict({"kind": "background", "name": "Fix it", "id": "11111111-2222-3333-4444-555555555555",
+                     "cwd": self.cwd}, **kw)
+
+    def test_an_interactive_session_is_focused_by_its_tab_label(self):
+        self.tabs = [{"tab_id": "w1:t1", "workspace_id": "w1", "label": "1"},
+                     {"tab_id": "w4:t2", "workspace_id": "w4", "label": "Fix it"}]
+        msg = roost.terminals.open_in_window(self.sess(kind="interactive"), "herdr")
+        self.assertTrue(msg.startswith("Switched to"))
+        self.assertEqual(self.made("workspace", "focus")[0][2], "w4")
+        self.assertEqual(self.made("tab", "focus")[0][2], "w4:t2")
+        self.assertEqual(self.made("tab", "create") + self.made("pane", "run"), [])
+
+    def test_an_attached_background_session_is_focused_too(self):
+        self.tabs = [{"tab_id": "w4:t2", "workspace_id": "w4", "label": "Fix it"}]
+        msg = roost.terminals.open_in_window(self.sess(attached=True), "herdr")
+        self.assertTrue(msg.startswith("Switched to"))
+        self.assertEqual(self.made("tab", "focus")[0][2], "w4:t2")
+
+    def test_an_open_session_with_no_matching_tab_says_its_window_was_not_found(self):
+        self.tabs = [{"tab_id": "w1:t1", "workspace_id": "w1", "label": "1"}]
+        msg = roost.terminals.open_in_window(self.sess(kind="interactive"), "herdr")
+        self.assertIn("is already open, but its window wasn't found", msg)
+        self.assertEqual(self.made("tab", "focus") + self.made("workspace", "focus"), [])
+
+    def test_a_closed_session_opens_a_tab_in_its_project_workspace_resuming_it(self):
+        self.workspaces = [{"workspace_id": "w2", "label": "p"}]
+        s = self.sess()
+        msg = roost.terminals.open_in_window(s, "herdr", group="p")
+        self.assertTrue(msg.startswith("Opened"))
+        (tab,) = self.made("tab", "create")
+        self.assertEqual((self.flag(tab, "--workspace"), self.flag(tab, "--label")), ("w2", "Fix it"))
+        self.assertEqual(self.flag(tab, "--cwd"), self.cwd)
+        self.assertEqual(self.made("workspace", "create"), [])
+        (run,) = self.made("pane", "run")
+        self.assertEqual(run[2], "w1:p7")
+        self.assertIn(f"claude --resume {s['id']}", run[3])
+
+    def test_a_background_session_with_an_attach_id_is_attached_to(self):
+        self.workspaces = [{"workspace_id": "w2", "label": "p"}]
+        roost.terminals.open_in_window(self.sess(attach="abcd1234"), "herdr", group="p")
+        run = self.made("pane", "run")[0]
+        self.assertIn("claude attach abcd1234", run[3])
+        self.assertNotIn("--resume", run[3])
+
+    def test_without_a_group_the_launch_folders_name_is_the_workspace(self):
+        self.workspaces = []
+        msg = roost.terminals.open_in_window(self.sess(), "herdr")
+        self.assertTrue(msg.startswith("Opened"))
+        self.assertEqual(self.flag(self.made("workspace", "create")[0], "--label"), "repo")
+        self.assertEqual(self.made("tab", "rename")[0][2:], ["w9:t1", "Fix it"])
+        self.assertIn("claude --resume", self.made("pane", "run")[0][3])
+
+    def test_without_a_group_an_existing_folder_workspace_is_reused(self):
+        self.workspaces = [{"workspace_id": "w3", "label": "repo"}]
+        roost.terminals.open_in_window(self.sess(), "herdr")
+        self.assertEqual(self.made("workspace", "create"), [])
+        self.assertEqual(self.flag(self.made("tab", "create")[0], "--workspace"), "w3")
+
+    def test_a_failed_herdr_call_while_opening_says_it_could_not(self):
+        self.herdr_down = True
+        msg = roost.terminals.open_in_window(self.sess(), "herdr", group="p")
+        self.assertTrue(msg.startswith("Couldn't open"))
+
+    # window titles
+
+    def test_window_titles_are_the_tab_labels(self):
+        self.tabs = [{"tab_id": "w1:t1", "workspace_id": "w1", "label": "Fix it"},
+                     {"tab_id": "w1:t2", "workspace_id": "w1", "label": "Other"}]
+        self.assertEqual(roost.terminals.window_titles("herdr"), ["Fix it", "Other"])
+
+    def test_window_titles_are_empty_when_herdr_fails(self):
+        self.herdr_down = True
+        self.assertEqual(roost.terminals.window_titles("herdr"), [])
+
+    def test_a_background_session_is_marked_open_by_its_tab_label(self):
+        import unittest.mock
+        self.tabs = [{"tab_id": "w1:t1", "workspace_id": "w1", "label": "Fix it"}]
+        with unittest.mock.patch.object(roost.terminals, "attach_clients", lambda: set()):
+            (s,) = roost.terminals.mark_open([self.sess()], "herdr")
+        self.assertTrue(s["attached"])
+
+    # inside herdr, roost is not in an IDE's terminal
+
+    def test_herdr_is_not_an_ide_terminal_even_with_a_jetbrains_environment(self):
+        env = {"HERDR_ENV": "1", "TERMINAL_EMULATOR": "JetBrains-JediTerm"}
+        self.assertIsNone(roost.terminals.ide_terminal(env))
+
+    def test_herdr_is_not_an_ide_terminal_even_with_a_vscode_environment(self):
+        env = {"HERDR_ENV": "1", "TERM_PROGRAM": "vscode"}
+        self.assertIsNone(roost.terminals.ide_terminal(env))
+
+    def test_without_herdr_env_the_ide_is_still_read(self):
+        self.assertEqual(roost.terminals.ide_terminal({"TERMINAL_EMULATOR": "JetBrains-JediTerm"}), "jetbrains")
+        self.assertEqual(roost.terminals.ide_terminal({"TERM_PROGRAM": "vscode"}), "vscode")
+
+    # the real herdr(): what it makes of a command's output
+
+    def run_herdr(self, *args, returncode=0, stdout="", stderr="", raises=None):
+        """_REAL_HERDR(*args) with subprocess.run faked to exit as given (or raise)."""
+        import subprocess, unittest.mock
+
+        def fake_run(argv, **kw):
+            self.assertEqual(argv, ["herdr", *args])
+            self.assertEqual(kw.get("stdin"), subprocess.DEVNULL)
+            if raises:
+                raise raises
+            return subprocess.CompletedProcess(argv, returncode, stdout, stderr)
+        with unittest.mock.patch.object(roost.terminals.subprocess, "run", fake_run):
+            return _REAL_HERDR(*args)
+
+    def test_a_command_that_prints_nothing_succeeds_with_an_empty_result(self):
+        self.assertEqual(self.run_herdr("pane", "run", "w1:p1", "ls"), {})
+
+    def test_a_command_that_prints_only_whitespace_succeeds_with_an_empty_result(self):
+        self.assertEqual(self.run_herdr("pane", "run", "w1:p1", "ls", stdout=" \n\n"), {})
+
+    def test_json_output_still_returns_its_result_object(self):
+        out = '{"id": "1", "result": {"type": "ok"}}'
+        self.assertEqual(self.run_herdr("tab", "focus", "w1:t1", stdout=out), {"type": "ok"})
+
+    def test_a_nonzero_exit_is_a_failure_even_with_empty_output(self):
+        self.assertIsNone(self.run_herdr("tab", "focus", "w1:t1", returncode=1, stderr="no such tab"))
+
+    def test_output_that_is_not_json_is_a_failure(self):
+        self.assertIsNone(self.run_herdr("tab", "list", stdout="Error: not a server\n"))
+
+    def test_a_missing_binary_is_a_failure(self):
+        self.assertIsNone(self.run_herdr("tab", "list", raises=FileNotFoundError("herdr")))
+
+    def test_a_hang_is_a_failure(self):
+        import subprocess
+        self.assertIsNone(self.run_herdr("tab", "list", raises=subprocess.TimeoutExpired("herdr", 10)))
+
+    def test_starting_a_session_works_when_herdr_prints_nothing_for_tab_rename_and_pane_run(self):
+        import subprocess, unittest.mock
+        ran = []
+
+        def fake_run(argv, **kw):
+            ran.append(argv[1:])
+            shown = {("workspace", "list"): {"type": "workspace_list", "workspaces": []},
+                     ("workspace", "create"): {"type": "workspace_created", "workspace": {"workspace_id": "w1", "label": "p"},
+                                               "tab": {"tab_id": "w1:t1", "workspace_id": "w1", "label": "1"},
+                                               "root_pane": {"pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1"}}}
+            result = shown.get(tuple(argv[1:3]))
+            out = json.dumps({"id": "x", "result": result}) if result else ""  # rename and run print nothing
+            return subprocess.CompletedProcess(argv, 0, out, "")
+        with unittest.mock.patch.object(roost.terminals, "herdr", _REAL_HERDR), \
+                unittest.mock.patch.object(roost.terminals.subprocess, "run", fake_run):
+            msg = roost.terminals.start_session("p", self.cwd, "herdr", "Fix it")
+        self.assertFalse(msg.startswith("Couldn't"), msg)
+        self.assertIn(["pane", "run"], [c[:2] for c in ran])
+        self.assertEqual([x["name"] for x in self.project_sessions()], ["Fix it"])
+
+    # claude in a herdr pane never runs as a child session, whatever herdr's terminal inherited
+
+    def pane_command(self):
+        import shlex
+        (run,) = self.made("pane", "run")
+        return shlex.split(run[3])
+
+    def test_start_runs_claude_with_the_child_session_variables_unset(self):
+        for env in roost_environments():
+            with self.subTest(env):
+                self.calls, self.workspaces = [], []
+                roost.terminals.start_session("p", self.cwd, "herdr", "Fix it")
+                argv = self.pane_command()
+                sid = argv[argv.index("--session-id") + 1]
+                assert_runs_claude_without_child_vars(self, argv, ["claude", "--session-id", sid, "-n", "Fix it",
+                                                                   *roost.plugin_args(), "/roost:pickup p"])
+
+    def test_plain_start_runs_claude_with_the_child_session_variables_unset(self):
+        for env in roost_environments():
+            with self.subTest(env):
+                self.calls, self.workspaces = [], []
+                roost.terminals.start_plain(self.cwd, "herdr")
+                assert_runs_claude_without_child_vars(self, self.pane_command(), ["claude", *roost.plugin_args()])
+
+    def test_resuming_runs_claude_with_the_child_session_variables_unset(self):
+        for env in roost_environments():
+            with self.subTest(env):
+                self.calls, self.workspaces = [], [{"workspace_id": "w2", "label": "p"}]
+                roost.terminals.open_in_window(self.sess(), "herdr", group="p")
+                assert_runs_claude_without_child_vars(self, self.pane_command(),
+                                                      ["claude", "--resume", self.sess()["id"]])
+
+    def test_attaching_runs_claude_with_the_child_session_variables_unset(self):
+        for env in roost_environments():
+            with self.subTest(env):
+                self.calls, self.workspaces = [], [{"workspace_id": "w2", "label": "p"}]
+                roost.terminals.open_in_window(self.sess(attach="abcd1234"), "herdr", group="p")
+                assert_runs_claude_without_child_vars(self, self.pane_command(), ["claude", "attach", "abcd1234"])
+
+
+class HerdrAppTerminal(unittest.TestCase):
+    """The Herdr desktop app ("herdr-app") as a roost terminal: one space per project (named with the project
+    id), one tab per Session (named with its name), all driven through terminals.herdr_app, the one boundary
+    the tests replace."""
+    README, fake_herdr = HerdrTerminal.README, HerdrTerminal.fake_herdr
+    made, flag, project_sessions = HerdrTerminal.made, HerdrTerminal.flag, HerdrTerminal.project_sessions
+
+    def setUp(self):
+        import unittest.mock
+        HerdrTerminal.setUp(self)  # the temp project, config and plugin; self.cwd; herdr and osa replaced
+        self.apps, self.down, self.spaces = [], False, []
+        self.minimized = Path(self.tmp.name) / "minimized.json"
+        for patcher in (unittest.mock.patch.object(roost.terminals, "herdr_app", self.fake_app),
+                        unittest.mock.patch.object(roost.terminals.config, "MINIMIZED", self.minimized, create=True)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    tearDown = HerdrTerminal.tearDown
+
+    def fake_app(self, *args):
+        self.apps.append(list(args))
+        if self.down:
+            return None
+        if args == ("ls",):
+            return {"spaces": self.spaces, "recent": []}
+        if args[:2] == ("do", "space.new"):
+            return {"space": "spNEW", "tab": "tbNEW", "terminal": "t2"}
+        if args[:2] == ("do", "tab.new"):
+            return {"space": self.flag(list(args), "--space"), "tab": "tbNEW", "terminal": "t2"}
+        if args[:2] == ("do", "terminal.park"):
+            return {"pending": True, "terminal": self.flag(list(args), "--terminal")}
+        if args[:2] == ("do", "terminal.keep"):
+            return {"pending": True, "terminal": self.flag(list(args), "--terminal"), "pane": "pK", "tab": "tbKEPT"}
+        return {"ok": True}
+
+    def do(self, verb):
+        """The args of every `do <verb>` call, in order."""
+        return [c for c in self.apps if c[:2] == ["do", verb]]
+
+    def argv(self, call):
+        """The claude argv a call ran, after the `env -u ...` prefix (its own tests check that prefix)."""
+        argv = json.loads(self.flag(call, "--argv"))
+        n = len(roost.terminals.UNSET_CHILD_SESSION)
+        return argv[n:] if argv[:n] == roost.terminals.UNSET_CHILD_SESSION else argv
+
+    def space(self, sid, name, *tabs):
+        return {"id": sid, "name": name, "folder": "/x", "active": False,
+                "tabs": [{"id": t, "name": n, "active": False, "terminals": []} for t, n in tabs]}
+
+    def sess(self, **kw):
+        return dict({"kind": "background", "name": "Fix it", "id": "11111111-2222-3333-4444-555555555555",
+                     "cwd": self.cwd}, **kw)
+
+    # the terminal exists, and is detected
+
+    def test_herdr_app_is_a_listed_terminal(self):
+        self.assertEqual(roost.terminals.TERMINALS["herdr-app"]["label"], "Herdr")
+
+    def test_the_apps_terminal_id_wins_over_ghostty_and_herdr_env(self):
+        import unittest.mock
+        env = {"HC_TERMINAL_ID": "t1", "TERM_PROGRAM": "ghostty", "HERDR_ENV": "1"}
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(roost.terminals.detect_terminal(), "herdr-app")
+
+    def test_an_empty_terminal_id_is_not_the_app(self):
+        import unittest.mock
+        with unittest.mock.patch.dict(os.environ, {"HC_TERMINAL_ID": "", "TERM_PROGRAM": "ghostty"}, clear=True):
+            self.assertEqual(roost.terminals.detect_terminal(), "ghostty")
+
+    def test_the_app_is_not_an_ide_terminal_even_with_a_jetbrains_environment(self):
+        env = {"HC_TERMINAL_ID": "t1", "TERMINAL_EMULATOR": "JetBrains-JediTerm"}
+        self.assertIsNone(roost.terminals.ide_terminal(env))
+
+    # starting a Session
+
+    def test_start_in_an_existing_space_adds_a_tab_there_and_selects_the_space(self):
+        self.spaces = [self.space("spA", "other"), self.space("spB", "p", ("tbX", "1"))]
+        msg = roost.terminals.start_session("p", self.cwd, "herdr-app", "Fix it")
+        self.assertEqual(self.apps[0], ["ls"])
+        self.assertEqual(self.do("space.new"), [])
+        (tab,) = self.do("tab.new")
+        self.assertEqual((self.flag(tab, "--name"), self.flag(tab, "--space"), self.flag(tab, "--folder")),
+                         ("Fix it", "spB", self.cwd))
+        argv = self.argv(tab)
+        sid = re.search(r"^[0-9a-f-]{36}$", argv[argv.index("--session-id") + 1]).group(0)
+        self.assertEqual((argv[0], argv[-1]), ("claude", "/roost:pickup p"))
+        (select,) = self.do("space.select")
+        self.assertEqual(self.flag(select, "--id"), "spB")
+        self.assertLess(self.apps.index(tab), self.apps.index(select))
+        self.assertFalse(msg.startswith("Couldn't"))
+        self.assertEqual(self.project_sessions()[-1], {"name": "Fix it", "id": sid})
+
+    def test_start_without_a_space_creates_one_with_the_session_as_its_tab(self):
+        self.spaces = [self.space("spA", "other")]
+        msg = roost.terminals.start_session("p", self.cwd, "herdr-app", "Fix it")
+        (new,) = self.do("space.new")
+        self.assertEqual((self.flag(new, "--name"), self.flag(new, "--folder"), self.flag(new, "--tab")),
+                         ("p", self.cwd, "Fix it"))
+        argv = self.argv(new)
+        self.assertEqual((argv[0], argv[-1]), ("claude", "/roost:pickup p"))
+        self.assertIn("--session-id", argv)
+        self.assertEqual(self.do("tab.new"), [])
+        self.assertFalse(msg.startswith("Couldn't"))
+        self.assertEqual(len(self.project_sessions()), 1)
+
+    def test_a_failed_app_call_records_nothing(self):
+        self.down = True
+        msg = roost.terminals.start_session("p", self.cwd, "herdr-app", "Fix it")
+        self.assertTrue(msg.startswith("Couldn't open"))
+        self.assertEqual(self.project_sessions(), [])
+
+    def test_a_failure_after_the_tab_exists_records_nothing(self):
+        self.spaces = [self.space("spB", "p")]
+        real = self.fake_app
+        roost.terminals.herdr_app = lambda *a: None if a[:2] == ("do", "space.select") else real(*a)  # undone by cleanup
+        msg = roost.terminals.start_session("p", self.cwd, "herdr-app", "Fix it")
+        self.assertTrue(msg.startswith("Couldn't open"))
+        self.assertEqual(self.project_sessions(), [])
+
+    def test_starting_in_the_app_never_uses_applescript_or_herdr(self):
+        self.spaces = []
+        roost.terminals.start_session("p", self.cwd, "herdr-app", "Fix it")
+        self.assertEqual((self.osa_calls, self.calls), ([], []))
+
+    # a Session with no project
+
+    def test_plain_start_names_space_and_tab_after_the_folder(self):
+        self.spaces = []
+        msg = roost.terminals.start_plain(self.cwd, "herdr-app")
+        (new,) = self.do("space.new")
+        self.assertEqual((self.flag(new, "--name"), self.flag(new, "--tab"), self.flag(new, "--folder")),
+                         ("repo", "repo", self.cwd))
+        argv = self.argv(new)
+        self.assertEqual(argv[0], "claude")
+        self.assertNotIn("--session-id", argv)
+        self.assertFalse(msg.startswith("Couldn't"))
+
+    def test_plain_start_reuses_the_folders_space(self):
+        self.spaces = [self.space("spC", "repo")]
+        roost.terminals.start_plain(self.cwd, "herdr-app")
+        self.assertEqual(self.do("space.new"), [])
+        (tab,) = self.do("tab.new")
+        self.assertEqual((self.flag(tab, "--space"), self.flag(tab, "--name")), ("spC", "repo"))
+        self.assertEqual(self.flag(self.do("space.select")[0], "--id"), "spC")
+
+    # opening an existing Session
+
+    def test_an_interactive_session_is_focused_by_its_tab_name(self):
+        self.spaces = [self.space("spA", "x", ("tb1", "1")), self.space("spD", "y", ("tb9", "Fix it"))]
+        msg = roost.terminals.open_in_window(self.sess(kind="interactive"), "herdr-app")
+        self.assertTrue(msg.startswith("Switched to"))
+        self.assertEqual(self.flag(self.do("space.select")[0], "--id"), "spD")
+        self.assertEqual(self.flag(self.do("tab.select")[0], "--id"), "tb9")
+        self.assertEqual(self.do("tab.new") + self.do("space.new"), [])
+
+    def test_an_attached_background_session_is_focused_too(self):
+        self.spaces = [self.space("spD", "y", ("tb9", "Fix it"))]
+        msg = roost.terminals.open_in_window(self.sess(attached=True), "herdr-app")
+        self.assertTrue(msg.startswith("Switched to"))
+        self.assertEqual(self.flag(self.do("tab.select")[0], "--id"), "tb9")
+
+    def test_an_open_session_with_no_matching_tab_says_its_window_was_not_found(self):
+        self.spaces = [self.space("spA", "x", ("tb1", "1"))]
+        msg = roost.terminals.open_in_window(self.sess(kind="interactive"), "herdr-app")
+        self.assertIn("is already open, but its window wasn't found", msg)
+        self.assertEqual(self.do("tab.select") + self.do("space.select"), [])
+
+    def test_a_closed_session_opens_a_tab_in_its_project_space_resuming_it(self):
+        self.spaces = [self.space("spB", "p")]
+        s = self.sess()
+        msg = roost.terminals.open_in_window(s, "herdr-app", group="p")
+        self.assertTrue(msg.startswith("Opened"))
+        (tab,) = self.do("tab.new")
+        self.assertEqual((self.flag(tab, "--name"), self.flag(tab, "--space"), self.flag(tab, "--folder")),
+                         ("Fix it", "spB", self.cwd))
+        self.assertEqual(self.argv(tab), ["claude", "--resume", s["id"]])
+        self.assertEqual(self.do("space.new"), [])
+
+    def test_a_background_session_with_an_attach_id_is_attached_to(self):
+        self.spaces = [self.space("spB", "p")]
+        roost.terminals.open_in_window(self.sess(attach="abcd1234"), "herdr-app", group="p")
+        self.assertEqual(self.argv(self.do("tab.new")[0]), ["claude", "attach", "abcd1234"])
+
+    def test_without_a_group_the_launch_folders_name_is_the_space(self):
+        self.spaces = []
+        msg = roost.terminals.open_in_window(self.sess(), "herdr-app")
+        self.assertTrue(msg.startswith("Opened"))
+        (new,) = self.do("space.new")
+        self.assertEqual((self.flag(new, "--name"), self.flag(new, "--tab")), ("repo", "Fix it"))
+        self.assertEqual(self.argv(new), ["claude", "--resume", self.sess()["id"]])
+
+    def test_without_a_group_an_existing_folder_space_is_reused(self):
+        self.spaces = [self.space("spC", "repo")]
+        roost.terminals.open_in_window(self.sess(), "herdr-app")
+        self.assertEqual(self.do("space.new"), [])
+        self.assertEqual(self.flag(self.do("tab.new")[0], "--space"), "spC")
+
+    def test_a_failed_app_call_while_opening_says_it_could_not(self):
+        self.down = True
+        msg = roost.terminals.open_in_window(self.sess(), "herdr-app", group="p")
+        self.assertTrue(msg.startswith("Couldn't open"))
+
+    # window titles
+
+    def test_window_titles_are_every_tab_name_across_spaces(self):
+        self.spaces = [self.space("spA", "x", ("tb1", "Fix it"), ("tb2", "Other")), self.space("spB", "y", ("tb3", "Third"))]
+        self.assertEqual(roost.terminals.window_titles("herdr-app"), ["Fix it", "Other", "Third"])
+
+    def test_window_titles_are_empty_when_the_app_fails(self):
+        self.down = True
+        self.assertEqual(roost.terminals.window_titles("herdr-app"), [])
+
+    def test_a_background_session_is_marked_open_by_its_tab_name(self):
+        import unittest.mock
+        self.spaces = [self.space("spA", "x", ("tb1", "Fix it"))]
+        with unittest.mock.patch.object(roost.terminals, "attach_clients", lambda: set()):
+            (s,) = roost.terminals.mark_open([self.sess()], "herdr-app")
+        self.assertTrue(s["attached"])
+
+    # the Sessions tab
+
+    def test_the_sessions_tab_opens_a_project_session_in_its_projects_space(self):
+        import unittest.mock
+        roost.link_session(self.folder, "11111111-2222-3333-4444-555555555555", "Fix it")
+        ui = Projects.ui(self)
+        ui.term = "herdr-app"
+        groups = []
+        with unittest.mock.patch.object(roost.terminals, "open_in_window",
+                                        lambda s, term, group=None: groups.append((term, group)) or "opened"):
+            ui.open_window(self.sess())
+        self.assertEqual(groups, [("herdr-app", "p")])
+
+    # claude in a Herdr app tab never runs as a child session, whatever the app's terminal inherited
+
+    def app_argv(self):
+        """The --argv of the one space.new or tab.new call."""
+        (call,) = self.do("space.new") + self.do("tab.new")
+        return json.loads(self.flag(call, "--argv"))
+
+    def check_each_space_case(self, start, claude_argv):
+        """start() in a new space and in an existing one, under each roost environment; claude_argv(argv)
+        is what claude should be run with."""
+        for env in roost_environments():
+            for spaces in ([], [self.space("spB", "p"), self.space("spC", "repo")]):
+                with self.subTest(env, existing_space=bool(spaces)):
+                    self.apps, self.spaces = [], spaces
+                    start()
+                    argv = self.app_argv()
+                    assert_runs_claude_without_child_vars(self, argv, claude_argv(argv))
+
+    def test_start_runs_claude_with_the_child_session_variables_unset(self):
+        def expected(argv):
+            sid = argv[argv.index("--session-id") + 1]
+            return ["claude", "--session-id", sid, "-n", "Fix it", *roost.plugin_args(), "/roost:pickup p"]
+        self.check_each_space_case(lambda: roost.terminals.start_session("p", self.cwd, "herdr-app", "Fix it"),
+                                   expected)
+
+    def test_plain_start_runs_claude_with_the_child_session_variables_unset(self):
+        self.check_each_space_case(lambda: roost.terminals.start_plain(self.cwd, "herdr-app"),
+                                   lambda argv: ["claude", *roost.plugin_args()])
+
+    def test_resuming_runs_claude_with_the_child_session_variables_unset(self):
+        self.check_each_space_case(lambda: roost.terminals.open_in_window(self.sess(), "herdr-app", group="p"),
+                                   lambda argv: ["claude", "--resume", self.sess()["id"]])
+
+    def test_attaching_runs_claude_with_the_child_session_variables_unset(self):
+        self.check_each_space_case(
+            lambda: roost.terminals.open_in_window(self.sess(attach="abcd1234"), "herdr-app", group="p"),
+            lambda argv: ["claude", "attach", "abcd1234"])
+
+
+    # minimizing: a Session's tab goes away while it keeps running, and comes back in its project's space
+
+    def space_with(self, sid, name, tab_id, tab_name, terminal):
+        return {"id": sid, "name": name, "folder": "/x", "active": False,
+                "tabs": [{"id": tab_id, "name": tab_name, "active": False,
+                          "terminals": [{"terminal": terminal, "pane": "p1", "app": "claude-code", "sub_agents": []}]}]}
+
+    def remembered(self):
+        return json.loads(self.minimized.read_text()) if self.minimized.exists() else {}
+
+    def test_minimize_parks_the_terminal_of_the_sessions_tab_and_remembers_where_it_was(self):
+        self.spaces = [self.space_with("spP", "p", "tbS", "Fix it", "t7")]
+        s = self.sess(kind="interactive")
+        self.assertTrue(roost.terminals.app_minimize(s))
+        self.assertEqual([self.flag(c, "--terminal") for c in self.do("terminal.park")], ["t7"])
+        self.assertEqual(self.remembered()[s["id"]], {"terminal": "t7", "space": "p", "tab": "Fix it", "folder": "/x"})
+
+    def test_minimize_without_a_tab_for_the_session_parks_nothing(self):
+        self.spaces = [self.space_with("spP", "p", "tbS", "Something else", "t7")]
+        self.assertFalse(roost.terminals.app_minimize(self.sess(kind="interactive")))
+        self.assertEqual(self.do("terminal.park"), [])
+        self.assertEqual(self.remembered(), {})
+
+    def test_a_minimized_session_is_known_as_minimized(self):
+        self.spaces = [self.space_with("spP", "p", "tbS", "Fix it", "t7")]
+        s = self.sess(kind="interactive")
+        self.assertFalse(roost.terminals.is_minimized(s))
+        roost.terminals.app_minimize(s)
+        self.assertTrue(roost.terminals.is_minimized(s))
+
+    def test_restore_into_its_existing_space_selects_it_keeps_the_terminal_as_a_tab_and_names_it(self):
+        self.spaces = [self.space_with("spP", "p", "tbS", "Fix it", "t7")]
+        s = self.sess(kind="interactive")
+        roost.terminals.app_minimize(s)
+        self.apps.clear()
+        self.assertTrue(roost.terminals.app_restore(s))
+        verbs = [c[1] for c in self.apps if c[0] == "do"]
+        self.assertEqual(verbs, ["space.select", "terminal.keep", "tab.rename"])  # select first, so the tab lands there
+        self.assertEqual(self.flag(self.do("space.select")[0], "--id"), "spP")
+        self.assertEqual(self.flag(self.do("terminal.keep")[0], "--terminal"), "t7")
+        self.assertEqual(self.flag(self.do("terminal.keep")[0], "--place"), "tab")
+        rename = self.do("tab.rename")[0]
+        self.assertEqual((self.flag(rename, "--id"), self.flag(rename, "--name")), ("tbKEPT", "Fix it"))
+        self.assertEqual(self.remembered(), {})
+
+    def test_restore_when_its_space_closed_makes_the_space_and_closes_the_placeholder_tab(self):
+        self.spaces = [self.space_with("spP", "p", "tbS", "Fix it", "t7")]
+        s = self.sess(kind="interactive")
+        roost.terminals.app_minimize(s)
+        self.spaces, self.apps[:] = [], []  # parking its only tab closed the space
+        self.assertTrue(roost.terminals.app_restore(s))
+        verbs = [c[1] for c in self.apps if c[0] == "do"]
+        self.assertEqual(verbs, ["space.new", "space.select", "terminal.keep", "tab.rename", "tab.close"])
+        made = self.do("space.new")[0]
+        self.assertEqual((self.flag(made, "--name"), self.flag(made, "--folder")), ("p", "/x"))
+        self.assertEqual(self.flag(self.do("space.select")[0], "--id"), "spNEW")
+        self.assertEqual(self.flag(self.do("tab.close")[0], "--id"), "tbNEW")
+        self.assertEqual(self.remembered(), {})
+
+    def test_restore_of_a_session_never_minimized_does_nothing(self):
+        self.assertFalse(roost.terminals.app_restore(self.sess(kind="interactive")))
+        self.assertEqual(self.do("terminal.keep"), [])
+
+    def test_a_failed_restore_keeps_the_record_so_it_can_be_tried_again(self):
+        self.spaces = [self.space_with("spP", "p", "tbS", "Fix it", "t7")]
+        s = self.sess(kind="interactive")
+        roost.terminals.app_minimize(s)
+        self.down = True
+        self.assertFalse(roost.terminals.app_restore(s))
+        self.assertIn(s["id"], self.remembered())
+
+    def test_going_to_a_minimized_sessions_window_restores_it(self):
+        self.spaces = [self.space_with("spP", "p", "tbS", "Fix it", "t7")]
+        s = self.sess(kind="interactive")
+        roost.terminals.app_minimize(s)
+        self.spaces = []
+        msg = roost.terminals.open_in_window(s, "herdr-app", group="p")
+        self.assertEqual(len(self.do("terminal.keep")), 1)
+        self.assertIn("Restored", msg)
 
 
 if __name__ == "__main__":

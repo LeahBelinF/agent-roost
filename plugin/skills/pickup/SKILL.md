@@ -20,5 +20,6 @@ The project to pick up: `$ARGUMENTS`
    A sub-project's id is `<project>/<slug>`. Its brief starts with the parent project's README as the wider context, then the sub-project's own README and Handoffs, then the parent's other open sub-projects. Keep the parent's goals in view, and keep the work inside this sub-project: when something belongs to the parent or to another sub-project, say so instead of doing it.
 3. **Read only what the brief points to.** The README and the Handoffs are the catch-up. Open a working doc only when the task needs it; don't read `data/`, `out/`, or `_archive/`, and don't read older Handoffs unless the person asks.
 4. **Report back in a few lines:** where things stand, what's next (from the README's Next and the newest Handoff), and any open questions the Handoffs left. Then ask what to work on, unless the person already said.
+5. **A `## Waiting prompt` at the end of the brief** is a prompt the person sent to the last Session after its cache went cold; roost held it back and wrote that Session's Handoff. Treat it as the person's request: after the short report, start on it instead of asking what to work on.
 
 Don't change directory, don't edit the README here, and never resume an old Session (`claude --resume`). For flags, run `roost project --help` or `roost project brief --help`.

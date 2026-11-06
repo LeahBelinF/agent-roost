@@ -354,6 +354,13 @@ class SessionsTab:
         ids = set(s.get("ids") or [s["id"]])
         return next((p for p in self.all_projects() if ids & set(p["sessions"])), None)
 
+    def open_window(self, s):
+        """open_in_window, opening s in its project's workspace when the terminal is herdr."""
+        if self.term not in ("herdr", "herdr-app"):
+            return terminals.open_in_window(s, self.term)
+        p = self.project_of(s)
+        return terminals.open_in_window(s, self.term, group=projectdata.project_id(p["path"]) if p else None)
+
     def resume_refused(self, s):
         """Roost never resumes project work (claude --resume): a closed Session a project lists is
         picked up by a fresh Session instead. Says so and returns True when that's the case."""
@@ -403,7 +410,12 @@ class SessionsTab:
             work.append(("Start a fresh Session from its recap", lambda: self.start_from_recap(recap, s)))
         else:
             label = "Go to Claude Desktop" if s.get("desktop") else "Go to its window" if in_window else "Open in a new window" if self.term else "Open here"
+            parkable = self.term == "herdr-app" and in_window and not s.get("desktop")
+            if parkable and terminals.is_minimized(s):
+                label = "Restore its window"
             work.append((label, lambda: self.open_one(s)))
+            if parkable and not terminals.is_minimized(s):
+                work.append(("Minimize its window", lambda: self.minimize(s)))
         if recap:
             work.append((f"Read its Session recap in {self.editor_name().split()[0]}", lambda: self.edit(recap["path"])))
             organize.append(("Make it a project (its recap's Handoffs move in)", lambda: self.new_project(recap)))
@@ -462,7 +474,7 @@ class SessionsTab:
         """Reopen a closed project Session, which a plain open refuses."""
         if not self.term:
             return s
-        self.msg = terminals.open_in_window(s, self.term)
+        self.msg = self.open_window(s)
         self.refresh()
         return None
 
@@ -475,8 +487,16 @@ class SessionsTab:
             return None
         if not self.term:
             return s
-        self.msg = terminals.open_in_window(s, self.term)
+        self.msg = self.open_window(s)
         self.refresh()
+        return None
+
+    def minimize(self, s):
+        """Take a Session's tab away in the Herdr app; it keeps running, and Restore brings it back."""
+        if terminals.app_minimize(s):
+            self.msg = f"Minimized {s['name']}: it keeps running, and its actions have Restore"
+        else:
+            self.msg = f"Couldn't minimize {s['name']}: its tab wasn't found in the Herdr app"
         return None
 
     def pin(self, s):
