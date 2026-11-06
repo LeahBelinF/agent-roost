@@ -10,6 +10,17 @@
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "r=\"${CLAUDE_PLUGIN_ROOT}/../bin/roost\"; [ -x \"$r\" ] || r=roost; \"$r\" hook stop 2>/dev/null || true",
+            "timeout": 10
+          }
+        ]
+      }
     ]
   }
 }
